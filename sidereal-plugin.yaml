@@ -1,10 +1,10 @@
 name: mastodon-blade-mcp
 version: "0.1.0"
 description: "Mastodon operations — timelines, statuses, notifications, search, interactions, multi-instance"
-author: piersdd
+author: groupthink-dev
 licence: MIT
 tier: certified
-homepage: https://github.com/piersdd/mastodon-blade-mcp
+homepage: https://github.com/groupthink-dev/mastodon-blade-mcp
 contract: social-v1
 
 services:

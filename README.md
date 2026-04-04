@@ -30,7 +30,7 @@ A security-first, token-efficient MCP server for Mastodon. 45 tools across timel
 uv tool install mastodon-blade-mcp
 
 # Or from source
-git clone https://github.com/piersdd/mastodon-blade-mcp.git
+git clone https://github.com/groupthink-dev/mastodon-blade-mcp.git
 cd mastodon-blade-mcp
 make install
 ```
