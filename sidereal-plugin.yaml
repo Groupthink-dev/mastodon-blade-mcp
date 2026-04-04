@@ -1,0 +1,89 @@
+name: mastodon-blade-mcp
+version: "0.1.0"
+description: "Mastodon operations — timelines, statuses, notifications, search, interactions, multi-instance"
+author: piersdd
+licence: MIT
+tier: certified
+homepage: https://github.com/piersdd/mastodon-blade-mcp
+contract: social-v1
+
+services:
+  social:
+    timeline: mastodon_timeline_home
+    status: mastodon_status
+    search: mastodon_search
+    notifications: mastodon_notifications
+    context: mastodon_context
+    account: mastodon_account
+    trending: mastodon_trending_tags
+    bookmarks: mastodon_bookmarks
+    favourites: mastodon_favourites
+    relationships: mastodon_relationships
+    lists: mastodon_lists
+    filters: mastodon_filters
+    conversations: mastodon_conversations
+    instance: mastodon_info
+    post: mastodon_post
+    delete: mastodon_delete
+    favourite: mastodon_favourite
+    boost: mastodon_boost
+    follow: mastodon_follow
+    block: mastodon_block
+
+setup:
+  icon: "\U0001F418"
+  blurb: "Connect to Mastodon for timeline browsing, search, notifications, and social interactions."
+  auth_model: api_key
+  complexity: trivial
+  fields:
+    - key: MASTODON_INSTANCE
+      label: "Instance URL"
+      secret: false
+      placeholder: "https://mastodon.social"
+      required: true
+    - key: MASTODON_TOKEN
+      label: "Access Token"
+      secret: true
+      placeholder: "your-access-token"
+      required: true
+      help: "Preferences > Development > New Application > Access Token"
+    - key: MASTODON_WRITE_ENABLED
+      label: "Enable write operations"
+      secret: false
+      placeholder: "false"
+      required: false
+  test:
+    endpoint: "/api/v1/accounts/verify_credentials"
+    auth_style: bearer
+  help:
+    - label: "Mastodon API docs"
+      url: "https://docs.joinmastodon.org/api/"
+    - label: "Creating access tokens"
+      url: "https://docs.joinmastodon.org/client/token/"
+
+install:
+  runtime: uv
+  package: mastodon-blade-mcp
+  command: mastodon-blade-mcp
+
+env:
+  - name: MASTODON_INSTANCE
+    description: "Mastodon instance URL (single-instance mode)"
+  - name: MASTODON_TOKEN
+    description: "OAuth access token"
+    secret: true
+  - name: MASTODON_PROVIDERS
+    description: "Comma-separated provider names for multi-instance"
+  - name: MASTODON_WRITE_ENABLED
+    description: "Enable write operations (posting, favouriting, following)"
+    default: "false"
+
+requires:
+  sidereal: ">=0.40"
+
+conformance:
+  required: "4/4"
+  recommended: "6/6"
+  optional: "4/4"
+  gated: "6/6"
+  last_tested: "2026-04-04"
