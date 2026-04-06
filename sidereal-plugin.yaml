@@ -49,9 +49,10 @@ setup:
       help: "Preferences > Development > New Application > Access Token"
     - key: MASTODON_WRITE_ENABLED
       label: "Enable write operations"
+      type: boolean
       secret: false
-      placeholder: "false"
       required: false
+      help: "Posting, favouriting, boosting, and following"
   test:
     endpoint: "/api/v1/accounts/verify_credentials"
     auth_style: bearer
