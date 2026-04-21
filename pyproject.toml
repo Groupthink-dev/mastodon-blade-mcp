@@ -1,6 +1,6 @@
 [project]
 name = "mastodon-blade-mcp"
-version = "0.1.0"
+version = "0.1.1"
 description = "Mastodon MCP Server — timelines, statuses, notifications, search, interactions, multi-instance"
 readme = "README.md"
 license = {text = "MIT"}
