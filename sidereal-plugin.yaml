@@ -56,7 +56,7 @@ setup:
       required: false
       help: "Posting, favouriting, boosting, and following"
   test:
-    endpoint: "/api/v1/accounts/verify_credentials"
+    endpoint: "{MASTODON_INSTANCE}/api/v1/accounts/verify_credentials"
     auth_style: bearer
   help:
     - label: "Mastodon API docs"
