@@ -185,6 +185,55 @@ desc-1 | @reply1@mastodon.social | 2026-04-04 11:00 | public | First reply
 desc-2 | @reply2@mastodon.social | 2026-04-04 12:00 | public | Second reply
 ```
 
+### Tool output shape — `_meta` envelope (DD-338 A.1)
+
+Four read tools — `mastodon_timeline_home`, `mastodon_search`,
+`mastodon_notifications`, `mastodon_account_statuses` — append a single-line
+`_meta:` JSON-tail block to their payload (separated from the rendered output
+by a single blank line, `\n\n`). This is the canonical envelope shape for the
+DD-287 / DD-333 substrate; tail-parsers that stop at the first trailing newline
+remain back-compat with the pre-A.1 string output.
+
+```
+<existing pipe-delimited payload>
+
+_meta: {"matched_total": 23, "returned": 18, "filtered_by": ["scope=personal", "limit=20"], "redactions": [], "next_cursor": "12345", "latency_ms": 412}
+```
+
+Fields:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `matched_total` | int | Records the upstream Mastodon call surfaced before any post-fetch filter |
+| `returned` | int | Records remaining after scope-filter + limit |
+| `filtered_by` | string[] | Applied filters, alphabetically sorted, scope first (e.g. `["scope=family", "limit=20"]`) |
+| `redactions` | string[] | Degradations (e.g. `scope=family_unconfigured`, `list_membership_unavailable`, `account_outside_scope`); empty when clean |
+| `next_cursor` | string | `null` | Surfaced `max_id` from Mastodon's `Link: rel="next"` header |
+| `latency_ms` | int | Wall-clock time spent inside the upstream call |
+| `error_notes` | string[] | Optional; populated only on partial failures |
+
+### `scope=` argument
+
+The four tools above accept an optional `scope=` argument with the closed
+vocabulary `public|personal|family|work`:
+
+- `scope=public` (or omitted): no filtering; back-compat default.
+- `scope ∈ {personal, family, work}`: maps to a Mastodon list ID via the
+  `MASTODON_<SCOPE>_LIST_ID` environment variable. Per-instance suffix
+  supported as `MASTODON_<SCOPE>_LIST_ID_<INSTANCE>` (e.g.
+  `MASTODON_PERSONAL_LIST_ID_HACHYDERM`). Unset env var → request still
+  succeeds, `_meta.redactions` notes the unconfigured scope.
+- `scope` ∉ vocabulary → `Error: Unknown scope: <value>. Valid: public|personal|family|work`
+
+Per-tool semantics:
+
+| Tool | What scope filters |
+|------|-------------------|
+| `mastodon_timeline_home` | Swaps endpoint to `/api/v1/timelines/list/{list_id}` |
+| `mastodon_search` | Post-fetch filter on `statuses` array (accounts + hashtags pass through) |
+| `mastodon_notifications` | Post-fetch filter by notification *actor* account |
+| `mastodon_account_statuses` | Membership precondition — refuses if `account_id` not in list |
+
 ## Security Model
 
 | Layer | Mechanism |
@@ -217,6 +266,9 @@ Omit `instance` to use the default (first configured) instance.
 | `MASTODON_{NAME}_INSTANCE` | Per-provider instance URL | Per-provider |
 | `MASTODON_{NAME}_TOKEN` | Per-provider token | Per-provider |
 | `MASTODON_WRITE_ENABLED` | Enable write operations | No (default: false) |
+| `MASTODON_PERSONAL_LIST_ID` | Mastodon list ID mapped to `scope=personal`. Per-instance form: `MASTODON_PERSONAL_LIST_ID_<INSTANCE>` | No |
+| `MASTODON_FAMILY_LIST_ID` | Mastodon list ID mapped to `scope=family`. Per-instance form: `MASTODON_FAMILY_LIST_ID_<INSTANCE>` | No |
+| `MASTODON_WORK_LIST_ID` | Mastodon list ID mapped to `scope=work`. Per-instance form: `MASTODON_WORK_LIST_ID_<INSTANCE>` | No |
 | `MASTODON_MCP_TRANSPORT` | `stdio` or `http` | No (default: stdio) |
 | `MASTODON_MCP_HOST` | HTTP bind address | No (default: 127.0.0.1) |
 | `MASTODON_MCP_PORT` | HTTP port | No (default: 8770) |

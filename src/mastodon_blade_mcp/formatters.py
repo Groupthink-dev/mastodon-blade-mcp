@@ -10,6 +10,7 @@ All formatters return compact strings optimised for LLM consumption:
 from __future__ import annotations
 
 import html
+import json
 import re
 from typing import Any
 
@@ -499,3 +500,42 @@ def format_media(media: dict[str, Any]) -> str:
     if desc:
         parts.append(f'alt="{truncate(desc, 100)}"')
     return " | ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# DD-338 A.1 -- _meta envelope (JSON-tail wire shape)
+# ---------------------------------------------------------------------------
+
+
+def format_meta(
+    matched_total: int,
+    returned: int,
+    filtered_by: list[str],
+    redactions: list[str] | None = None,
+    next_cursor: str | None = None,
+    latency_ms: int = 0,
+    error_notes: list[str] | None = None,
+) -> str:
+    """Render the canonical _meta JSON-tail block (DD-338 architect amendment).
+
+    Returns a single-line ``_meta: {...}`` string. Caller appends with ``\\n\\n``
+    separator after the existing formatted payload. Assembler regex is
+    ``\\n\\n_meta: (\\{.*\\})$`` -- the JSON value MUST be single-line.
+    """
+    payload: dict[str, Any] = {
+        "matched_total": int(matched_total),
+        "returned": int(returned),
+        "filtered_by": list(filtered_by),
+        "redactions": list(redactions or []),
+        "next_cursor": next_cursor,
+        "latency_ms": int(latency_ms),
+    }
+    if error_notes:
+        payload["error_notes"] = list(error_notes)
+    # Use canonical separators matching spec example: ', ' and ': '.
+    return "_meta: " + json.dumps(payload, ensure_ascii=False)
+
+
+def append_meta(payload: str, meta_block: str) -> str:
+    """Append a meta_block to an existing payload with the canonical separator."""
+    return f"{payload}\n\n{meta_block}"
