@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re as _re
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -129,7 +131,7 @@ class TestMastodonTimelineHome:
     async def test_returns_statuses(self, mastodon_env: None) -> None:
         with patch.object(server_module, "_get_client") as mock_gc:
             mock_client = AsyncMock()
-            mock_client.timeline_home.return_value = [make_status()]
+            mock_client.timeline_home_paginated.return_value = ([make_status()], None)
             mock_gc.return_value = mock_client
             result = await server_module.mastodon_timeline_home()
             assert "Hello world!" in result
@@ -140,7 +142,7 @@ class TestMastodonTimelineHome:
 
         with patch.object(server_module, "_get_client") as mock_gc:
             mock_client = AsyncMock()
-            mock_client.timeline_home.side_effect = MastodonError("test error")
+            mock_client.timeline_home_paginated.side_effect = MastodonError("test error")
             mock_gc.return_value = mock_client
             result = await server_module.mastodon_timeline_home()
             assert "Error:" in result
@@ -173,11 +175,14 @@ class TestMastodonSearch:
     async def test_search(self, mastodon_env: None) -> None:
         with patch.object(server_module, "_get_client") as mock_gc:
             mock_client = AsyncMock()
-            mock_client.search.return_value = {
-                "accounts": [make_account()],
-                "statuses": [],
-                "hashtags": [],
-            }
+            mock_client.search_paginated.return_value = (
+                {
+                    "accounts": [make_account()],
+                    "statuses": [],
+                    "hashtags": [],
+                },
+                None,
+            )
             mock_gc.return_value = mock_client
             result = await server_module.mastodon_search("test")
             assert "Accounts" in result
@@ -203,7 +208,7 @@ class TestMastodonNotifications:
     async def test_returns_notifications(self, mastodon_env: None) -> None:
         with patch.object(server_module, "_get_client") as mock_gc:
             mock_client = AsyncMock()
-            mock_client.get_notifications.return_value = [make_notification()]
+            mock_client.get_notifications_paginated.return_value = ([make_notification()], None)
             mock_gc.return_value = mock_client
             result = await server_module.mastodon_notifications()
             assert "mention" in result
@@ -464,3 +469,413 @@ class TestMastodonMediaUpload:
             mock_gc.return_value = mock_client
             result = await server_module.mastodon_media_upload("/tmp/test.jpg", description="A test image")
             assert "id=media-1" in result
+
+
+# ===========================================================================
+# DD-338 A.1 -- scope + _meta envelope tests
+# ===========================================================================
+
+
+def _parse_meta(result: str) -> dict:
+    """Extract the trailing _meta JSON block from a tool return string."""
+    match = _re.search(r"\n\n_meta: (\{.*\})$", result)
+    assert match is not None, f"No _meta block found in:\n{result}"
+    return json.loads(match.group(1))
+
+
+# -- mastodon_timeline_home ------------------------------------------------
+
+
+class TestTimelineHomeScope:
+    @pytest.mark.asyncio
+    async def test_happy_path_scope_personal_resolves(
+        self, mastodon_env: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MASTODON_PERSONAL_LIST_ID", "list-42")
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.timeline_list_paginated.return_value = ([make_status()], None)
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_timeline_home(scope="personal")
+            mock_client.timeline_list_paginated.assert_awaited_once()
+            assert "Hello world!" in result
+            meta = _parse_meta(result)
+            assert "scope=personal" in meta["filtered_by"]
+            assert meta["redactions"] == []
+
+    @pytest.mark.asyncio
+    async def test_happy_path_scope_public_passthrough(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.timeline_home_paginated.return_value = ([make_status()], None)
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_timeline_home(scope="public")
+            meta = _parse_meta(result)
+            assert not any(f.startswith("scope=") for f in meta["filtered_by"])
+            assert meta["redactions"] == []
+
+    @pytest.mark.asyncio
+    async def test_degradation_unconfigured_list(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.timeline_home_paginated.return_value = ([make_status()], None)
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_timeline_home(scope="personal")
+            mock_client.timeline_home_paginated.assert_awaited_once()
+            meta = _parse_meta(result)
+            assert "scope=personal_unconfigured" in meta["redactions"]
+
+    @pytest.mark.asyncio
+    async def test_rejection_unknown_scope(self, mastodon_env: None) -> None:
+        result = await server_module.mastodon_timeline_home(scope="invalid")
+        assert "Error:" in result
+        assert "public" in result and "personal" in result
+
+    @pytest.mark.asyncio
+    async def test_back_compat_omitted_scope(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.timeline_home_paginated.return_value = ([make_status()], None)
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_timeline_home()
+            assert "Hello world!" in result
+            meta = _parse_meta(result)
+            assert not any(f.startswith("scope=") for f in meta["filtered_by"])
+
+    @pytest.mark.asyncio
+    async def test_cursor_passthrough(self, mastodon_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MASTODON_PERSONAL_LIST_ID", "list-42")
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.timeline_list_paginated.return_value = ([], "next-9999")
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_timeline_home(scope="personal", max_id="abc")
+            mock_client.timeline_list_paginated.assert_awaited_once_with("list-42", 20, "abc", None)
+            meta = _parse_meta(result)
+            assert meta["next_cursor"] == "next-9999"
+
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.timeline_home_paginated.return_value = ([make_status()], None)
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_timeline_home()
+            assert result.endswith(_re.search(r"_meta: \{.*\}$", result).group(0))
+            meta = _parse_meta(result)
+            for key in ("matched_total", "returned", "filtered_by", "redactions", "next_cursor", "latency_ms"):
+                assert key in meta
+            assert isinstance(meta["matched_total"], int)
+            assert isinstance(meta["returned"], int)
+            assert isinstance(meta["filtered_by"], list)
+            assert isinstance(meta["redactions"], list)
+            assert isinstance(meta["latency_ms"], int)
+
+
+# -- mastodon_search -------------------------------------------------------
+
+
+class TestSearchScope:
+    @pytest.mark.asyncio
+    async def test_happy_path_scope_personal_resolves(
+        self, mastodon_env: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MASTODON_PERSONAL_LIST_ID", "list-42")
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            in_list = make_status(status_id="s1", acct="alice@mastodon.social")
+            in_list["account"]["id"] = "11"
+            out_of_list = make_status(status_id="s2", acct="bob@mastodon.social")
+            out_of_list["account"]["id"] = "22"
+            mock_client.search_paginated.return_value = (
+                {"accounts": [], "statuses": [in_list, out_of_list], "hashtags": []},
+                None,
+            )
+            mock_client.list_accounts_cached.return_value = {"11"}
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_search("test", scope="personal")
+            meta = _parse_meta(result)
+            assert "scope=personal:statuses_only" in meta["filtered_by"]
+            assert meta["matched_total"] == 2
+            assert meta["returned"] == 1
+
+    @pytest.mark.asyncio
+    async def test_happy_path_scope_public_passthrough(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.search_paginated.return_value = (
+                {"accounts": [make_account()], "statuses": [], "hashtags": []},
+                None,
+            )
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_search("test", scope="public")
+            meta = _parse_meta(result)
+            assert not any(f.startswith("scope=") for f in meta["filtered_by"])
+
+    @pytest.mark.asyncio
+    async def test_degradation_unconfigured_list(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.search_paginated.return_value = (
+                {"accounts": [], "statuses": [make_status()], "hashtags": []},
+                None,
+            )
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_search("test", scope="family")
+            meta = _parse_meta(result)
+            assert "scope=family_unconfigured" in meta["redactions"]
+
+    @pytest.mark.asyncio
+    async def test_rejection_unknown_scope(self, mastodon_env: None) -> None:
+        result = await server_module.mastodon_search("test", scope="invalid")
+        assert "Error:" in result
+
+    @pytest.mark.asyncio
+    async def test_back_compat_omitted_scope(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.search_paginated.return_value = (
+                {"accounts": [make_account()], "statuses": [], "hashtags": []},
+                None,
+            )
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_search("test")
+            meta = _parse_meta(result)
+            assert not any(f.startswith("scope=") for f in meta["filtered_by"])
+
+    @pytest.mark.asyncio
+    async def test_cursor_passthrough(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.search_paginated.return_value = (
+                {"accounts": [], "statuses": [], "hashtags": []},
+                None,
+            )
+            mock_gc.return_value = mock_client
+            await server_module.mastodon_search("test", type="statuses", limit=15)
+            mock_client.search_paginated.assert_awaited_once_with("test", "statuses", 15, None)
+
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.search_paginated.return_value = (
+                {"accounts": [], "statuses": [], "hashtags": []},
+                None,
+            )
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_search("test")
+            meta = _parse_meta(result)
+            for key in ("matched_total", "returned", "filtered_by", "redactions", "next_cursor", "latency_ms"):
+                assert key in meta
+
+    @pytest.mark.asyncio
+    async def test_list_membership_unavailable(self, mastodon_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+        from mastodon_blade_mcp.client import MastodonError
+
+        monkeypatch.setenv("MASTODON_PERSONAL_LIST_ID", "list-42")
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.list_accounts_cached.side_effect = MastodonError("list fetch failed")
+            mock_client.search_paginated.return_value = (
+                {"accounts": [], "statuses": [make_status()], "hashtags": []},
+                None,
+            )
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_search("test", scope="personal")
+            meta = _parse_meta(result)
+            assert "list_membership_unavailable" in meta["redactions"]
+
+
+# -- mastodon_notifications ------------------------------------------------
+
+
+class TestNotificationsScope:
+    @pytest.mark.asyncio
+    async def test_happy_path_scope_personal_resolves(
+        self, mastodon_env: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MASTODON_PERSONAL_LIST_ID", "list-42")
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            in_list = make_notification(notification_id="n1", acct="alice@mastodon.social")
+            in_list["account"]["id"] = "11"
+            out_of_list = make_notification(notification_id="n2", acct="bob@mastodon.social")
+            out_of_list["account"]["id"] = "22"
+            mock_client.get_notifications_paginated.return_value = ([in_list, out_of_list], None)
+            mock_client.list_accounts_cached.return_value = {"11"}
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_notifications(scope="personal")
+            meta = _parse_meta(result)
+            assert meta["matched_total"] == 2
+            assert meta["returned"] == 1
+            assert "scope=personal" in meta["filtered_by"]
+
+    @pytest.mark.asyncio
+    async def test_happy_path_scope_public_passthrough(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_notifications_paginated.return_value = ([make_notification()], None)
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_notifications(scope="public")
+            meta = _parse_meta(result)
+            assert not any(f.startswith("scope=") for f in meta["filtered_by"])
+
+    @pytest.mark.asyncio
+    async def test_degradation_unconfigured_list(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_notifications_paginated.return_value = ([make_notification()], None)
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_notifications(scope="work")
+            meta = _parse_meta(result)
+            assert "scope=work_unconfigured" in meta["redactions"]
+
+    @pytest.mark.asyncio
+    async def test_rejection_unknown_scope(self, mastodon_env: None) -> None:
+        result = await server_module.mastodon_notifications(scope="invalid")
+        assert "Error:" in result
+
+    @pytest.mark.asyncio
+    async def test_back_compat_omitted_scope(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_notifications_paginated.return_value = ([make_notification()], None)
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_notifications()
+            meta = _parse_meta(result)
+            assert not any(f.startswith("scope=") for f in meta["filtered_by"])
+
+    @pytest.mark.asyncio
+    async def test_cursor_passthrough(self, mastodon_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MASTODON_PERSONAL_LIST_ID", "list-42")
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_notifications_paginated.return_value = ([], "n-cursor")
+            mock_client.list_accounts_cached.return_value = set()
+            mock_gc.return_value = mock_client
+            await server_module.mastodon_notifications(scope="personal", max_id="abc", limit=15)
+            mock_client.get_notifications_paginated.assert_awaited_once_with(None, 15, "abc", None)
+
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_notifications_paginated.return_value = ([], None)
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_notifications()
+            meta = _parse_meta(result)
+            for key in ("matched_total", "returned", "filtered_by", "redactions", "next_cursor", "latency_ms"):
+                assert key in meta
+
+
+# -- mastodon_account_statuses ---------------------------------------------
+
+
+class TestAccountStatusesScope:
+    @pytest.mark.asyncio
+    async def test_happy_path_scope_personal_resolves(
+        self, mastodon_env: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("MASTODON_PERSONAL_LIST_ID", "list-42")
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.list_accounts_cached.return_value = {"11"}
+            mock_client.get_account_statuses_paginated.return_value = ([make_status()], None)
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_account_statuses("11", scope="personal")
+            assert "Hello world!" in result
+            meta = _parse_meta(result)
+            assert "scope=personal" in meta["filtered_by"]
+            assert meta["redactions"] == []
+
+    @pytest.mark.asyncio
+    async def test_happy_path_scope_public_passthrough(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_account_statuses_paginated.return_value = ([make_status()], None)
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_account_statuses("11", scope="public")
+            meta = _parse_meta(result)
+            assert not any(f.startswith("scope=") for f in meta["filtered_by"])
+
+    @pytest.mark.asyncio
+    async def test_degradation_unconfigured_list(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_account_statuses_paginated.return_value = ([make_status()], None)
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_account_statuses("11", scope="family")
+            meta = _parse_meta(result)
+            assert "scope=family_unconfigured" in meta["redactions"]
+
+    @pytest.mark.asyncio
+    async def test_rejection_unknown_scope(self, mastodon_env: None) -> None:
+        result = await server_module.mastodon_account_statuses("11", scope="invalid")
+        assert "Error:" in result
+
+    @pytest.mark.asyncio
+    async def test_back_compat_omitted_scope(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_account_statuses_paginated.return_value = ([make_status()], None)
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_account_statuses("11")
+            meta = _parse_meta(result)
+            assert not any(f.startswith("scope=") for f in meta["filtered_by"])
+
+    @pytest.mark.asyncio
+    async def test_cursor_passthrough(self, mastodon_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MASTODON_PERSONAL_LIST_ID", "list-42")
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.list_accounts_cached.return_value = {"11"}
+            mock_client.get_account_statuses_paginated.return_value = ([], "cur-1")
+            mock_gc.return_value = mock_client
+            await server_module.mastodon_account_statuses("11", scope="personal", max_id="abc")
+            mock_client.get_account_statuses_paginated.assert_awaited_once_with(
+                "11", 20, "abc", False, False, False, None
+            )
+
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_account_statuses_paginated.return_value = ([], None)
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_account_statuses("11")
+            meta = _parse_meta(result)
+            for key in ("matched_total", "returned", "filtered_by", "redactions", "next_cursor", "latency_ms"):
+                assert key in meta
+
+    @pytest.mark.asyncio
+    async def test_membership_precondition_fail(self, mastodon_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MASTODON_FAMILY_LIST_ID", "list-99")
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.list_accounts_cached.return_value = {"11"}
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_account_statuses("22", scope="family")
+            assert "Error: account_id not in scope=family list" in result
+            meta = _parse_meta(result)
+            assert "account_outside_scope" in meta["redactions"]
+            # Should NOT have fetched statuses
+            mock_client.get_account_statuses_paginated.assert_not_awaited()
+
+
+# -- conformance stub ------------------------------------------------------
+
+
+class TestPerInstanceEnvVarSuffix:
+    """OQ-1: per-instance env var suffix uppercases + replaces non-alphanumeric with _."""
+
+    @pytest.mark.asyncio
+    async def test_per_instance_suffix_wins(self, mastodon_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MASTODON_PERSONAL_LIST_ID", "fallback-list")
+        monkeypatch.setenv("MASTODON_PERSONAL_LIST_ID_HACHYDERM", "instance-list")
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.timeline_list_paginated.return_value = ([], None)
+            mock_gc.return_value = mock_client
+            await server_module.mastodon_timeline_home(scope="personal", instance="hachyderm")
+            mock_client.timeline_list_paginated.assert_awaited_once_with("instance-list", 20, None, "hachyderm")

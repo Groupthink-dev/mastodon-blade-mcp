@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 
@@ -15,6 +16,19 @@ from mastodon_blade_mcp.models import MastodonError, ProviderConfig, resolve_pro
 from mastodon_blade_mcp.rate_limiter import RateLimiter
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_next_cursor(pagination: dict[str, str]) -> str | None:
+    """Pull max_id value from Link rel=next URL, if present."""
+    next_url = pagination.get("next")
+    if not next_url:
+        return None
+    try:
+        qs = parse_qs(urlparse(next_url).query)
+        max_id = qs.get("max_id", [None])[0]
+        return max_id if max_id else None
+    except (ValueError, KeyError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +121,9 @@ class MastodonClient:
         self._providers = resolve_providers()
         self._http: dict[str, httpx.AsyncClient] = {}
         self._rate_limiter = RateLimiter()
+        # DD-338 A.1 -- cache of (instance_name, list_id) -> set of account IDs.
+        # Populated lazily on first scope filter; no TTL at v1.
+        self._list_accounts_cache: dict[tuple[str, str], set[str]] = {}
 
     @property
     def provider_names(self) -> list[str]:
@@ -671,6 +688,123 @@ class MastodonClient:
         self._rate_limiter.update_from_response(provider.name, response)
         response.raise_for_status()
         return response.json()  # type: ignore[no-any-return]
+
+    # -----------------------------------------------------------------------
+    # DD-338 A.1 -- scope-aware variants returning (data, next_cursor)
+    # -----------------------------------------------------------------------
+
+    async def timeline_home_paginated(
+        self,
+        limit: int = 20,
+        max_id: str | None = None,
+        instance: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Home timeline with surfaced next_cursor (max_id from Link header)."""
+        params: dict[str, str | int] = {"limit": min(limit, 40)}
+        if max_id:
+            params["max_id"] = max_id
+        data, pagination = await self._request("GET", "/api/v1/timelines/home", instance, params=params)
+        return data, _extract_next_cursor(pagination)
+
+    async def timeline_list_paginated(
+        self,
+        list_id: str,
+        limit: int = 20,
+        max_id: str | None = None,
+        instance: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """List timeline with surfaced next_cursor."""
+        params: dict[str, str | int] = {"limit": min(limit, 40)}
+        if max_id:
+            params["max_id"] = max_id
+        data, pagination = await self._request("GET", f"/api/v1/timelines/list/{list_id}", instance, params=params)
+        return data, _extract_next_cursor(pagination)
+
+    async def search_paginated(
+        self,
+        q: str,
+        search_type: str | None = None,
+        limit: int = 20,
+        instance: str | None = None,
+    ) -> tuple[dict[str, Any], str | None]:
+        """Search with surfaced pagination (search rarely paginates, but plumb anyway)."""
+        params: dict[str, str | int] = {"q": q, "limit": min(limit, 40)}
+        if search_type:
+            params["type"] = search_type
+        data, pagination = await self._request("GET", "/api/v2/search", instance, params=params)
+        return data, _extract_next_cursor(pagination)
+
+    async def get_notifications_paginated(
+        self,
+        types: list[str] | None = None,
+        limit: int = 20,
+        max_id: str | None = None,
+        instance: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Notifications with surfaced next_cursor."""
+        if types:
+            query_parts: list[tuple[str, str | int]] = [("limit", min(limit, 40))]
+            if max_id:
+                query_parts.append(("max_id", max_id))
+            for t in types:
+                query_parts.append(("types[]", t))
+            data, pagination = await self._request("GET", "/api/v1/notifications", instance, params=query_parts)
+        else:
+            params: dict[str, str | int] = {"limit": min(limit, 40)}
+            if max_id:
+                params["max_id"] = max_id
+            data, pagination = await self._request("GET", "/api/v1/notifications", instance, params=params)
+        return data, _extract_next_cursor(pagination)
+
+    async def get_account_statuses_paginated(
+        self,
+        account_id: str,
+        limit: int = 20,
+        max_id: str | None = None,
+        exclude_reblogs: bool = False,
+        only_media: bool = False,
+        pinned: bool = False,
+        instance: str | None = None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Account statuses with surfaced next_cursor."""
+        params: dict[str, str | int | bool] = {"limit": min(limit, 40)}
+        if max_id:
+            params["max_id"] = max_id
+        if exclude_reblogs:
+            params["exclude_reblogs"] = True
+        if only_media:
+            params["only_media"] = True
+        if pinned:
+            params["pinned"] = True
+        data, pagination = await self._request(
+            "GET", f"/api/v1/accounts/{account_id}/statuses", instance, params=params
+        )
+        return data, _extract_next_cursor(pagination)
+
+    async def list_accounts_cached(
+        self,
+        list_id: str,
+        instance: str | None = None,
+    ) -> set[str]:
+        """Return the set of account IDs in a list, cached per (instance, list_id).
+
+        Raises MastodonError on fetch failure (caller decides whether to degrade).
+        """
+        provider_name = self._resolve_provider(instance).name
+        cache_key = (provider_name, list_id)
+        if cache_key in self._list_accounts_cache:
+            return self._list_accounts_cache[cache_key]
+        # Fetch with a generous limit; Mastodon caps at 80/page so iterate if needed.
+        accounts: list[dict[str, Any]] = []
+        params: dict[str, int] = {"limit": 80}
+        path = f"/api/v1/lists/{list_id}/accounts"
+        # One page is fine for v1; multi-page list expansion is a Phase A.2 enrichment.
+        data, _ = await self._request("GET", path, instance, params=params)
+        if isinstance(data, list):
+            accounts = data
+        ids = {str(a.get("id", "")) for a in accounts if a.get("id")}
+        self._list_accounts_cache[cache_key] = ids
+        return ids
 
     # -----------------------------------------------------------------------
     # Cleanup

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import time
 from typing import Annotated
 
 from fastmcp import FastMCP
@@ -17,6 +19,7 @@ from pydantic import Field
 
 from mastodon_blade_mcp.client import MastodonClient, MastodonError
 from mastodon_blade_mcp.formatters import (
+    append_meta,
     format_account,
     format_account_list,
     format_context,
@@ -25,6 +28,7 @@ from mastodon_blade_mcp.formatters import (
     format_instance_info,
     format_lists,
     format_media,
+    format_meta,
     format_notifications,
     format_relationships,
     format_search_results,
@@ -39,6 +43,53 @@ from mastodon_blade_mcp.models import (
     check_write_gate,
     is_write_enabled,
 )
+
+# ---------------------------------------------------------------------------
+# DD-338 A.1 -- scope-tag vocabulary
+# ---------------------------------------------------------------------------
+
+_VALID_SCOPES = ("public", "personal", "family", "work")
+_SCOPE_ENV_PREFIX = {
+    "personal": "MASTODON_PERSONAL_LIST_ID",
+    "family": "MASTODON_FAMILY_LIST_ID",
+    "work": "MASTODON_WORK_LIST_ID",
+}
+
+
+def _normalise_instance(instance: str | None) -> str:
+    """Uppercase + non-alphanumeric -> _, for env var suffix."""
+    if not instance:
+        return ""
+    return re.sub(r"[^A-Z0-9]", "_", instance.upper())
+
+
+def _resolve_list_id(scope: str, instance: str | None) -> str | None:
+    """Map (scope, instance) to a Mastodon list ID via env-var indirection.
+
+    Priority: per-instance suffix (MASTODON_<SCOPE>_LIST_ID_<INSTANCE>) -> bare
+    form (MASTODON_<SCOPE>_LIST_ID). Returns None when neither resolves; caller
+    surfaces the unconfigured degradation in _meta.redactions.
+    """
+    if scope not in _SCOPE_ENV_PREFIX:
+        return None
+    base_env = _SCOPE_ENV_PREFIX[scope]
+    suffix = _normalise_instance(instance)
+    if suffix:
+        per_instance = os.environ.get(f"{base_env}_{suffix}", "").strip()
+        if per_instance:
+            return per_instance
+    bare = os.environ.get(base_env, "").strip()
+    return bare or None
+
+
+def _validate_scope(scope: str | None) -> tuple[str | None, str | None]:
+    """Validate scope; return (normalised_scope, error_string_if_invalid)."""
+    if scope is None:
+        return None, None
+    if scope not in _VALID_SCOPES:
+        return None, (f"Error: Unknown scope: {scope}. Valid: " + "|".join(_VALID_SCOPES))
+    return scope, None
+
 
 logger = logging.getLogger(__name__)
 
@@ -132,12 +183,57 @@ async def mastodon_verify(
 async def mastodon_timeline_home(
     limit: Annotated[int, Field(description="Max statuses to return")] = 20,
     max_id: Annotated[str | None, Field(description="Return statuses older than this ID (pagination)")] = None,
+    scope: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Scope tag (public|personal|family|work). Maps to a Mastodon list via "
+                "MASTODON_*_LIST_ID env vars (per-instance suffix supported); scope=public "
+                "or omitted is unfiltered."
+            )
+        ),
+    ] = None,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """Home timeline -- statuses from followed accounts."""
+    """Home timeline -- statuses from followed accounts.
+
+    DD-338 A.1: when scope ∈ {personal,family,work} and the matching list-id env var
+    resolves, the request swaps to /api/v1/timelines/list/{list_id}. Unset env var
+    degrades to passthrough with _meta.redactions: ["scope=<scope>_unconfigured"].
+    """
+    norm_scope, scope_err = _validate_scope(scope)
+    if scope_err:
+        return scope_err
+    filtered_by: list[str] = []
+    redactions: list[str] = []
+    list_id: str | None = None
+    if norm_scope and norm_scope != "public":
+        list_id = _resolve_list_id(norm_scope, instance)
+        if list_id:
+            filtered_by.append(f"scope={norm_scope}")
+        else:
+            redactions.append(f"scope={norm_scope}_unconfigured")
+    filtered_by.append(f"limit={limit}")
+    if max_id:
+        filtered_by.append(f"max_id={max_id}")
+    filtered_by.sort()
+    start = time.perf_counter()
     try:
-        data = await _get_client().timeline_home(limit, max_id, instance)
-        return format_timeline(data)
+        if list_id:
+            data, next_cursor = await _get_client().timeline_list_paginated(list_id, limit, max_id, instance)
+        else:
+            data, next_cursor = await _get_client().timeline_home_paginated(limit, max_id, instance)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        payload = format_timeline(data)
+        meta = format_meta(
+            matched_total=len(data),
+            returned=len(data),
+            filtered_by=filtered_by,
+            redactions=redactions,
+            next_cursor=next_cursor,
+            latency_ms=latency_ms,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
@@ -268,12 +364,69 @@ async def mastodon_search(
     q: Annotated[str, Field(description="Search query")],
     type: Annotated[str | None, Field(description="Filter by type: accounts, statuses, or hashtags")] = None,
     limit: Annotated[int, Field(description="Max results per type")] = 20,
+    scope: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Scope tag (public|personal|family|work). Restricts status results to "
+                "accounts in the scope's list (accounts + hashtags pass through). "
+                "scope=public or omitted is unfiltered."
+            )
+        ),
+    ] = None,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """Unified search across accounts, statuses, and hashtags."""
+    """Unified search across accounts, statuses, and hashtags.
+
+    DD-338 A.1: when scope ∈ {personal,family,work} and the matching list-id env var
+    resolves, the ``statuses`` portion of results is filtered to authors in the list.
+    Accounts and hashtags are not scope-filtered (scope vocabulary doesn't apply).
+    """
+    norm_scope, scope_err = _validate_scope(scope)
+    if scope_err:
+        return scope_err
+    filtered_by: list[str] = [f"limit={limit}"]
+    if type:
+        filtered_by.append(f"type={type}")
+    redactions: list[str] = []
+    member_ids: set[str] | None = None
+    list_id: str | None = None
+    if norm_scope and norm_scope != "public":
+        list_id = _resolve_list_id(norm_scope, instance)
+        if list_id:
+            try:
+                member_ids = await _get_client().list_accounts_cached(list_id, instance)
+                filtered_by.append(f"scope={norm_scope}:statuses_only")
+            except MastodonError:
+                redactions.append("list_membership_unavailable")
+        else:
+            redactions.append(f"scope={norm_scope}_unconfigured")
+    filtered_by.sort()
+    start = time.perf_counter()
     try:
-        data = await _get_client().search(q, type, limit, instance)
-        return format_search_results(data)
+        data, next_cursor = await _get_client().search_paginated(q, type, limit, instance)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        statuses = list(data.get("statuses", []) or [])
+        matched_total = len(data.get("accounts", []) or []) + len(statuses) + len(data.get("hashtags", []) or [])
+        if member_ids is not None:
+            filtered_statuses = [s for s in statuses if str(s.get("account", {}).get("id", "")) in member_ids]
+            data = dict(data)
+            data["statuses"] = filtered_statuses
+        returned = (
+            len(data.get("accounts", []) or [])
+            + len(data.get("statuses", []) or [])
+            + len(data.get("hashtags", []) or [])
+        )
+        payload = format_search_results(data)
+        meta = format_meta(
+            matched_total=matched_total,
+            returned=returned,
+            filtered_by=filtered_by,
+            redactions=redactions,
+            next_cursor=next_cursor,
+            latency_ms=latency_ms,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
@@ -309,14 +462,81 @@ async def mastodon_account_statuses(
     exclude_reblogs: Annotated[bool, Field(description="Exclude reblogs")] = False,
     only_media: Annotated[bool, Field(description="Only show statuses with media")] = False,
     pinned: Annotated[bool, Field(description="Only show pinned statuses")] = False,
+    scope: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Scope tag (public|personal|family|work) used as a membership precondition: "
+                "refuses if account_id is outside the scope's list. scope=public or omitted "
+                "bypasses the precondition."
+            )
+        ),
+    ] = None,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """Get an account's statuses with filtering options."""
+    """Get an account's statuses with filtering options.
+
+    DD-338 A.1: scope is a membership *precondition* (not a result filter) -- if
+    ``account_id`` is not in the scope's list, returns an Error with
+    ``_meta.redactions: ["account_outside_scope"]``.
+    """
+    norm_scope, scope_err = _validate_scope(scope)
+    if scope_err:
+        return scope_err
+    filtered_by: list[str] = [f"limit={limit}"]
+    if exclude_reblogs:
+        filtered_by.append("exclude_reblogs=true")
+    if only_media:
+        filtered_by.append("only_media=true")
+    if pinned:
+        filtered_by.append("pinned=true")
+    redactions: list[str] = []
+    precondition_failed = False
+    list_id: str | None = None
+    if norm_scope and norm_scope != "public":
+        list_id = _resolve_list_id(norm_scope, instance)
+        if list_id:
+            try:
+                member_ids = await _get_client().list_accounts_cached(list_id, instance)
+                if str(account_id) not in member_ids:
+                    redactions.append("account_outside_scope")
+                    precondition_failed = True
+                else:
+                    filtered_by.append(f"scope={norm_scope}")
+            except MastodonError:
+                redactions.append("list_membership_unavailable")
+        else:
+            redactions.append(f"scope={norm_scope}_unconfigured")
+    filtered_by.sort()
+    if precondition_failed:
+        meta = format_meta(
+            matched_total=0,
+            returned=0,
+            filtered_by=filtered_by,
+            redactions=redactions,
+            next_cursor=None,
+            latency_ms=0,
+        )
+        return append_meta(
+            f"Error: account_id not in scope={norm_scope} list",
+            meta,
+        )
+    start = time.perf_counter()
     try:
-        data = await _get_client().get_account_statuses(
+        data, next_cursor = await _get_client().get_account_statuses_paginated(
             account_id, limit, max_id, exclude_reblogs, only_media, pinned, instance
         )
-        return format_timeline(data)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        payload = format_timeline(data)
+        meta = format_meta(
+            matched_total=len(data),
+            returned=len(data),
+            filtered_by=filtered_by,
+            redactions=redactions,
+            next_cursor=next_cursor,
+            latency_ms=latency_ms,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
@@ -390,12 +610,61 @@ async def mastodon_notifications(
     ] = None,
     limit: Annotated[int, Field(description="Max notifications")] = 20,
     max_id: Annotated[str | None, Field(description="Return notifications older than this ID")] = None,
+    scope: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Scope tag (public|personal|family|work). Filters notifications to those "
+                "whose acting account (mentioner/favouriter/follower) is in the scope's list. "
+                "Does NOT filter by status author. scope=public or omitted is unfiltered."
+            )
+        ),
+    ] = None,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """List notifications, optionally filtered by type."""
+    """List notifications, optionally filtered by type.
+
+    DD-338 A.1: scope filters by the notification's *actor* (the account who
+    mentioned/favourited/followed/etc the authenticated user), not by status author.
+    """
+    norm_scope, scope_err = _validate_scope(scope)
+    if scope_err:
+        return scope_err
+    filtered_by: list[str] = [f"limit={limit}"]
+    if types:
+        filtered_by.append(f"types={','.join(sorted(types))}")
+    redactions: list[str] = []
+    member_ids: set[str] | None = None
+    list_id: str | None = None
+    if norm_scope and norm_scope != "public":
+        list_id = _resolve_list_id(norm_scope, instance)
+        if list_id:
+            try:
+                member_ids = await _get_client().list_accounts_cached(list_id, instance)
+                filtered_by.append(f"scope={norm_scope}")
+            except MastodonError:
+                redactions.append("list_membership_unavailable")
+        else:
+            redactions.append(f"scope={norm_scope}_unconfigured")
+    filtered_by.sort()
+    start = time.perf_counter()
     try:
-        data = await _get_client().get_notifications(types, limit, max_id, instance)
-        return format_notifications(data)
+        data, next_cursor = await _get_client().get_notifications_paginated(types, limit, max_id, instance)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        matched_total = len(data)
+        if member_ids is not None:
+            data = [n for n in data if str(n.get("account", {}).get("id", "")) in member_ids]
+        returned = len(data)
+        payload = format_notifications(data)
+        meta = format_meta(
+            matched_total=matched_total,
+            returned=returned,
+            filtered_by=filtered_by,
+            redactions=redactions,
+            next_cursor=next_cursor,
+            latency_ms=latency_ms,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
