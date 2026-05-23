@@ -12,6 +12,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -546,3 +547,74 @@ def format_meta(
 def append_meta(payload: str, meta_block: str) -> str:
     """Append a meta_block to an existing payload with the canonical separator."""
     return f"{payload}\n\n{meta_block}"
+
+
+# ---------------------------------------------------------------------------
+# DD-338 B.1.b -- canonical sort helpers (sort-before-return)
+# ---------------------------------------------------------------------------
+
+
+def _safe_int_id(record: dict[str, Any]) -> int:
+    """Cast record["id"] via int(); fall back to -1 on missing / non-int-castable.
+
+    Mastodon API returns snowflake ids as decimal-formatted strings; sorting
+    lexicographically is unsafe (varying length). int() works for both bare-
+    integer and string forms. Records missing "id" or carrying a non-castable
+    value sort last (treated as -1).
+
+    Per spec OQ-2 (architect amendment 2026-05-23): wraps the cast in a
+    try/except ValueError fallback so a malformed v1-filter id doesn't crash
+    the whole tool.
+    """
+    raw = record.get("id") if isinstance(record, dict) else None
+    if raw is None:
+        return -1
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return -1
+
+
+def sort_by_id_desc(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sort records by int(id) descending. Snowflake-safe (no lex surprises).
+
+    Used by status/notification/account/conversation-shaped read tools where
+    the natural ordering is newest-first on the monotonic snowflake id.
+
+    Records missing an ``id`` key sort last (treated as id=-1) -- defensive;
+    should not occur in practice on Mastodon API responses.
+    """
+    return sorted(records, key=_safe_int_id, reverse=True)
+
+
+def sort_by_id_asc(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Sort records by int(id) ascending. For user-curated containers (lists, filters).
+
+    Ascending id = creation order, stable and predictable for containers the
+    user manages directly.
+    """
+    return sorted(records, key=_safe_int_id)
+
+
+def sort_preserve_rank_tie_break_by(
+    records: list[dict[str, Any]],
+    tie_key: Callable[[dict[str, Any]], Any],
+) -> list[dict[str, Any]]:
+    """Preserve server-returned rank (input order) with deterministic tie-break.
+
+    Used by trending_tags / trending_statuses / trending_links where the
+    server's rank order IS the trending signal and must be preserved as the
+    primary key. The tie_key only matters when two records share the same
+    rank position -- it makes that situation byte-deterministic instead of
+    relying on the upstream's potentially-random tie-ordering.
+
+    Python's sort is stable; pairing (rank_index, tie_key) as the sort key
+    keeps rank dominant while making ties deterministic.
+    """
+    return [
+        r
+        for _, _, r in sorted(
+            [(i, tie_key(r), r) for i, r in enumerate(records)],
+            key=lambda x: (x[0], x[1]),
+        )
+    ]
