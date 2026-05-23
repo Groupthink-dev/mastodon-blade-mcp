@@ -515,12 +515,17 @@ def format_meta(
     next_cursor: str | None = None,
     latency_ms: int = 0,
     error_notes: list[str] | None = None,
+    domain_hints: dict[str, str] | None = None,
 ) -> str:
     """Render the canonical _meta JSON-tail block (DD-338 architect amendment).
 
     Returns a single-line ``_meta: {...}`` string. Caller appends with ``\\n\\n``
     separator after the existing formatted payload. Assembler regex is
     ``\\n\\n_meta: (\\{.*\\})$`` -- the JSON value MUST be single-line.
+
+    DD-338 A.2.dom.c — when ``domain_hints`` is non-empty, an additional
+    ``domain_hints: {record_id: domain}`` entry is emitted. Empty / None ⇒
+    key omitted entirely (Convention #22 graceful degradation).
     """
     payload: dict[str, Any] = {
         "matched_total": int(matched_total),
@@ -532,6 +537,8 @@ def format_meta(
     }
     if error_notes:
         payload["error_notes"] = list(error_notes)
+    if domain_hints:
+        payload["domain_hints"] = dict(domain_hints)
     # Use canonical separators matching spec example: ', ' and ': '.
     return "_meta: " + json.dumps(payload, ensure_ascii=False)
 

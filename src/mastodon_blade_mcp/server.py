@@ -12,12 +12,17 @@ import logging
 import os
 import re
 import time
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastmcp import FastMCP
 from pydantic import Field
 
 from mastodon_blade_mcp.client import MastodonClient, MastodonError
+from mastodon_blade_mcp.domain_hint import (
+    Pattern,
+    compute_domain_hint,
+    load_patterns_from_yaml,
+)
 from mastodon_blade_mcp.formatters import (
     append_meta,
     format_account,
@@ -92,6 +97,114 @@ def _validate_scope(scope: str | None) -> tuple[str | None, str | None]:
 
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# DD-338 A.2.dom.c -- per-record domain hint loader + projector
+# ---------------------------------------------------------------------------
+
+
+def _state_root() -> str:
+    """Resolve the Stallari state root (env override or default Application Support path)."""
+    return os.environ.get(
+        "STALLARI_STATE_ROOT",
+        os.path.expanduser("~/Library/Application Support/Stallari"),
+    )
+
+
+def _sanitize_blade_id(blade_id: str) -> str:
+    """Sanitize a blade id for filesystem use (matches StallariPaths.bladeConfig case)."""
+    return blade_id.lower().replace("/", "_")
+
+
+def _load_blade_config(blade_id: str) -> list[Pattern]:
+    """Load domain-hint patterns for ``blade_id`` from BladeConfigStore.
+
+    Path: ``<state-root>/blade-config/<sanitized-blade-id>/config.yaml``.
+
+    Missing file / IO error / parse error ⇒ empty list (Convention #22
+    graceful degradation). Reader of the DD-338 A.2.dom.a substrate contract
+    (Convention #23).
+    """
+    sanitized = _sanitize_blade_id(blade_id)
+    path = os.path.join(_state_root(), "blade-config", sanitized, "config.yaml")
+    try:
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return []
+    return load_patterns_from_yaml(content)
+
+
+def _field_projector(record: dict[str, Any], field: str) -> Any:
+    """Project a logical field name onto a Mastodon status record.
+
+    Status records follow the shape returned by ``/api/v1/statuses/...`` and
+    ``/api/v1/timelines/...``::
+
+        {
+            "id": "12345",
+            "account": {"acct": "user@instance.example", ...},
+            "content": "<p>...</p>",
+            "tags": [{"name": "linux"}, ...],
+            "mentions": [{"acct": "user@instance.example"}, ...],
+            "spoiler_text": "..."
+        }
+
+    Recognised logical fields:
+        - ``account_acct``: scalar string -- author's webfinger acct
+        - ``tags``: list of tag names (strings)
+        - ``mentions``: list of mention acct handles (strings)
+        - ``content``: scalar string -- HTML content body (use ``contains``)
+        - ``spoiler_text``: scalar string -- content warning text
+
+    Unknown field names return ``None`` (no match in computer).
+    """
+    if field == "account_acct":
+        acct = record.get("account", {})
+        if isinstance(acct, dict):
+            return acct.get("acct")
+        return None
+    if field == "tags":
+        tags = record.get("tags", [])
+        if not isinstance(tags, list):
+            return None
+        return [t.get("name") for t in tags if isinstance(t, dict) and t.get("name") is not None]
+    if field == "mentions":
+        mentions = record.get("mentions", [])
+        if not isinstance(mentions, list):
+            return None
+        return [m.get("acct") for m in mentions if isinstance(m, dict) and m.get("acct") is not None]
+    if field == "content":
+        return record.get("content")
+    if field == "spoiler_text":
+        return record.get("spoiler_text")
+    return None
+
+
+# Module-level cache of patterns (loaded once at import time).
+_PATTERNS: list[Pattern] = _load_blade_config("mastodon-blade-mcp")
+
+
+def _compute_domain_hints(records: list[dict[str, Any]]) -> dict[str, str]:
+    """Compute per-record domain hints for a list of status records.
+
+    Returns a ``{status_id: domain}`` mapping. Records that don't match any
+    pattern are omitted (no key emitted). Empty when ``_PATTERNS`` is empty.
+    """
+    if not _PATTERNS:
+        return {}
+    out: dict[str, str] = {}
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        rec_id = rec.get("id")
+        if rec_id is None:
+            continue
+        hint = compute_domain_hint(rec, _PATTERNS, _field_projector)
+        if hint is not None:
+            out[str(rec_id)] = hint
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Transport configuration
@@ -225,6 +338,7 @@ async def mastodon_timeline_home(
             data, next_cursor = await _get_client().timeline_home_paginated(limit, max_id, instance)
         latency_ms = int((time.perf_counter() - start) * 1000)
         payload = format_timeline(data)
+        domain_hints = _compute_domain_hints(data)
         meta = format_meta(
             matched_total=len(data),
             returned=len(data),
@@ -232,6 +346,7 @@ async def mastodon_timeline_home(
             redactions=redactions,
             next_cursor=next_cursor,
             latency_ms=latency_ms,
+            domain_hints=domain_hints or None,
         )
         return append_meta(payload, meta)
     except MastodonError as e:
@@ -418,6 +533,7 @@ async def mastodon_search(
             + len(data.get("hashtags", []) or [])
         )
         payload = format_search_results(data)
+        domain_hints = _compute_domain_hints(list(data.get("statuses", []) or []))
         meta = format_meta(
             matched_total=matched_total,
             returned=returned,
@@ -425,6 +541,7 @@ async def mastodon_search(
             redactions=redactions,
             next_cursor=next_cursor,
             latency_ms=latency_ms,
+            domain_hints=domain_hints or None,
         )
         return append_meta(payload, meta)
     except MastodonError as e:
@@ -528,6 +645,7 @@ async def mastodon_account_statuses(
         )
         latency_ms = int((time.perf_counter() - start) * 1000)
         payload = format_timeline(data)
+        domain_hints = _compute_domain_hints(data)
         meta = format_meta(
             matched_total=len(data),
             returned=len(data),
@@ -535,6 +653,7 @@ async def mastodon_account_statuses(
             redactions=redactions,
             next_cursor=next_cursor,
             latency_ms=latency_ms,
+            domain_hints=domain_hints or None,
         )
         return append_meta(payload, meta)
     except MastodonError as e:
@@ -656,6 +775,23 @@ async def mastodon_notifications(
             data = [n for n in data if str(n.get("account", {}).get("id", "")) in member_ids]
         returned = len(data)
         payload = format_notifications(data)
+        # Domain hints: prefer the embedded status (when present) for hint
+        # computation since pattern fields like tags / mentions / content live
+        # there. Notifications without a status (e.g. plain follow) get no hint.
+        notif_hints: dict[str, str] = {}
+        if _PATTERNS:
+            for notif in data:
+                if not isinstance(notif, dict):
+                    continue
+                notif_id = notif.get("id")
+                if notif_id is None:
+                    continue
+                status = notif.get("status")
+                if not isinstance(status, dict):
+                    continue
+                hint = compute_domain_hint(status, _PATTERNS, _field_projector)
+                if hint is not None:
+                    notif_hints[str(notif_id)] = hint
         meta = format_meta(
             matched_total=matched_total,
             returned=returned,
@@ -663,6 +799,7 @@ async def mastodon_notifications(
             redactions=redactions,
             next_cursor=next_cursor,
             latency_ms=latency_ms,
+            domain_hints=notif_hints or None,
         )
         return append_meta(payload, meta)
     except MastodonError as e:
