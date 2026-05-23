@@ -1,40 +1,28 @@
-"""Tests for DD-338 A.2.dom.c domain_hint pattern engine."""
+"""Tests for DD-338 A.2.dom.c domain_hint pattern engine.
+
+DD-338 Phase E.python correction: blade-level integration tests against the
+local ``compute_domain_hint`` wrapper in :mod:`mastodon_blade_mcp.server`,
+which pre-projects Mastodon's list-of-dict record shapes (``tags``,
+``mentions``) via ``_field_projector`` before delegating to the canonical
+2-arg helper. The canonical lib's dot-path navigation alone cannot address
+these list-of-dict shapes; without the projector, ``tags`` / ``mentions``
+patterns silently fail.
+"""
 
 from __future__ import annotations
 
 from typing import Any
 
 import pytest
+from stallari_mcp_helpers import Pattern, load_patterns_from_yaml
 
-from mastodon_blade_mcp.domain_hint import (
-    Pattern,
-    compute_domain_hint,
-    load_patterns_from_yaml,
-)
+from mastodon_blade_mcp.server import _field_projector, compute_domain_hint
 
 
 def _projector(record: dict[str, Any], field: str) -> Any:
-    """Mastodon-shape field projector mirroring server._field_projector."""
-    if field == "account_acct":
-        acct = record.get("account", {})
-        if isinstance(acct, dict):
-            return acct.get("acct")
-        return None
-    if field == "tags":
-        tags = record.get("tags", [])
-        if not isinstance(tags, list):
-            return None
-        return [t.get("name") for t in tags if isinstance(t, dict) and t.get("name") is not None]
-    if field == "mentions":
-        mentions = record.get("mentions", [])
-        if not isinstance(mentions, list):
-            return None
-        return [m.get("acct") for m in mentions if isinstance(m, dict) and m.get("acct") is not None]
-    if field == "content":
-        return record.get("content")
-    if field == "spoiler_text":
-        return record.get("spoiler_text")
-    return None
+    """Test-side projector mirroring server._field_projector for explicit
+    closure-binding in tests that pass a custom projector arg."""
+    return _field_projector(record, field)
 
 
 # ---------------------------------------------------------------------------
@@ -68,12 +56,27 @@ def test_compute_domain_hint_first_match_wins() -> None:
 
 
 def test_compute_domain_hint_glob_wildcard_on_mentions_list() -> None:
-    """Glob over list-valued projected field (mentions) — element-wise match."""
+    """Glob over list-valued projected field (mentions) — element-wise match.
+
+    This is the canonical regression case: without ``_field_projector``,
+    ``mentions`` is a list-of-dicts that the canonical lib's ``_matches``
+    helper skips entirely (``if isinstance(c, dict): continue``).
+    """
     record = {
         "id": "1",
         "mentions": [{"acct": "alice@home.example"}, {"acct": "bob@team.example.com"}],
     }
     patterns = [Pattern(field="mentions", op="glob", value="*@team.example.com", domain="work")]
+    assert compute_domain_hint(record, patterns, _projector) == "work"
+
+
+def test_compute_domain_hint_equals_on_tags_list() -> None:
+    """Equals against list-of-dict tags — element-wise match after projection."""
+    record = {
+        "id": "1",
+        "tags": [{"name": "linux"}, {"name": "rust"}],
+    }
+    patterns = [Pattern(field="tags", op="equals", value="rust", domain="work")]
     assert compute_domain_hint(record, patterns, _projector) == "work"
 
 
@@ -95,14 +98,26 @@ def test_compute_domain_hint_unknown_op_silently_skipped() -> None:
     """Schema-drift defence: unknown op skipped, next pattern still evaluated."""
     record = {"id": "1", "account": {"acct": "alice@example.social"}}
     patterns = [
-        Pattern(field="account_acct", op="regex", value=".*", domain="never"),
+        Pattern(field="account_acct", op="regex", value=".*", domain="never"),  # type: ignore[arg-type]
         Pattern(field="account_acct", op="equals", value="alice@example.social", domain="personal"),
     ]
     assert compute_domain_hint(record, patterns, _projector) == "personal"
 
 
+def test_compute_domain_hint_default_projector_arg() -> None:
+    """Wrapper's default projector arg uses server._field_projector — covers
+    the call-site that omits the explicit projector (in-tool dispatch sites
+    that rely on the default)."""
+    record = {
+        "id": "1",
+        "tags": [{"name": "family"}],
+    }
+    patterns = [Pattern(field="tags", op="equals", value="family", domain="family")]
+    assert compute_domain_hint(record, patterns) == "family"
+
+
 # ---------------------------------------------------------------------------
-# load_patterns_from_yaml
+# load_patterns_from_yaml (canonical lib — smoke for blade-relevant shapes)
 # ---------------------------------------------------------------------------
 
 

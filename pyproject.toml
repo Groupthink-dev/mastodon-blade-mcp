@@ -1,6 +1,6 @@
 [project]
 name = "mastodon-blade-mcp"
-version = "0.4.0"
+version = "0.5.0"
 description = "Mastodon MCP Server — timelines, statuses, notifications, search, interactions, multi-instance"
 readme = "README.md"
 license = {text = "MIT"}
@@ -20,6 +20,7 @@ dependencies = [
     "httpx>=0.28.1",
     "pydantic>=2.0.0",
     "pyyaml>=6.0",
+    "stallari-mcp-helpers>=0.1.0,<1.0.0",
 ]
 
 [dependency-groups]
@@ -63,3 +64,10 @@ warn_unused_ignores = true
 strict_equality = true
 show_error_codes = true
 pretty = true
+
+# stallari-mcp-helpers v0.1.0 ships without py.typed marker; suppress
+# import-untyped + downstream no-any-return cascade until the upstream
+# package ships type information.
+[[tool.mypy.overrides]]
+module = "stallari_mcp_helpers.*"
+ignore_missing_imports = true

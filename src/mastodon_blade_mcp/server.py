@@ -12,17 +12,20 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from typing import Annotated, Any
 
 from fastmcp import FastMCP
 from pydantic import Field
-
-from mastodon_blade_mcp.client import MastodonClient, MastodonError
-from mastodon_blade_mcp.domain_hint import (
+from stallari_mcp_helpers import (
     Pattern,
-    compute_domain_hint,
     load_patterns_from_yaml,
 )
+from stallari_mcp_helpers import (
+    compute_domain_hint as _canonical_compute_domain_hint,
+)
+
+from mastodon_blade_mcp.client import MastodonClient, MastodonError
 from mastodon_blade_mcp.formatters import (
     append_meta,
     format_account,
@@ -33,7 +36,6 @@ from mastodon_blade_mcp.formatters import (
     format_instance_info,
     format_lists,
     format_media,
-    format_meta,
     format_notifications,
     format_relationships,
     format_search_results,
@@ -42,6 +44,7 @@ from mastodon_blade_mcp.formatters import (
     format_trending_links,
     format_trending_tags,
     format_verify_credentials,
+    meta_envelope,
     sort_by_id_asc,
     sort_by_id_desc,
     sort_preserve_rank_tie_break_by,
@@ -135,7 +138,8 @@ def _load_blade_config(blade_id: str) -> list[Pattern]:
             content = f.read()
     except OSError:
         return []
-    return load_patterns_from_yaml(content)
+    patterns: list[Pattern] = load_patterns_from_yaml(content)
+    return patterns
 
 
 def _field_projector(record: dict[str, Any], field: str) -> Any:
@@ -186,6 +190,41 @@ def _field_projector(record: dict[str, Any], field: str) -> Any:
 
 # Module-level cache of patterns (loaded once at import time).
 _PATTERNS: list[Pattern] = _load_blade_config("mastodon-blade-mcp")
+
+
+def compute_domain_hint(
+    record: dict[str, Any],
+    patterns: list[Pattern],
+    field_projector: Callable[[dict[str, Any], str], Any] = _field_projector,
+) -> str | None:
+    """Mastodon-specific wrapper around the canonical ``compute_domain_hint``.
+
+    Bridges the canonical dot-path field-resolution model to Mastodon's
+    record-shape projector. Mastodon status records carry list-of-dict
+    shapes (``tags = [{"name": ...}, ...]``, ``mentions = [{"acct": ...}, ...]``)
+    that the canonical lib's dot-path navigation cannot address — its
+    ``_matches`` helper explicitly skips ``dict``-shaped list elements.
+    We pre-project each pattern's referenced field via ``field_projector``
+    and seed the result as a top-level key on a copy of the record so
+    canonical sees a uniform flat shape.
+
+    Authored against the same three-arg shape the blade has used since
+    DD-338 A.2.dom.c so existing tests + callers don't change.
+    """
+    if not patterns:
+        return None
+    projected = dict(record)
+    seen: set[str] = set()
+    for pattern in patterns:
+        field = pattern.field
+        if field in seen:
+            continue
+        seen.add(field)
+        value = field_projector(record, field)
+        if value is not None:
+            projected[field] = value
+    result: str | None = _canonical_compute_domain_hint(projected, patterns)
+    return result
 
 
 def _compute_domain_hints(records: list[dict[str, Any]]) -> dict[str, str]:
@@ -347,7 +386,7 @@ async def mastodon_timeline_home(
         data = sort_by_id_desc(data)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -392,7 +431,7 @@ async def mastodon_timeline_public(
         data = sort_by_id_desc(data)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -436,7 +475,7 @@ async def mastodon_timeline_local(
         data = sort_by_id_desc(data)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -487,7 +526,7 @@ async def mastodon_timeline_hashtag(
         data = sort_by_id_desc(data)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -532,7 +571,7 @@ async def mastodon_timeline_list(
         data = sort_by_id_desc(data)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -598,7 +637,7 @@ async def mastodon_context(
         matched_total = len(all_statuses)
         payload = format_context(data)
         domain_hints = _compute_domain_hints(all_statuses)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=matched_total,
             returned=matched_total,
             filtered_by=filtered_by,
@@ -690,7 +729,7 @@ async def mastodon_search(
         )
         payload = format_search_results(data)
         domain_hints = _compute_domain_hints(list(data.get("statuses", []) or []))
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=matched_total,
             returned=returned,
             filtered_by=filtered_by,
@@ -786,7 +825,7 @@ async def mastodon_account_statuses(
             redactions.append(f"scope={norm_scope}_unconfigured")
     filtered_by.sort()
     if precondition_failed:
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=0,
             returned=0,
             filtered_by=filtered_by,
@@ -807,7 +846,7 @@ async def mastodon_account_statuses(
         data = sort_by_id_desc(data)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -847,7 +886,7 @@ async def mastodon_relationships(
         # DD-338 OQ-6: sort by id ascending for byte-deterministic ordering.
         data = sort_by_id_asc(data)
         payload = format_relationships(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -887,7 +926,7 @@ async def mastodon_followers(
         latency_ms = int((time.perf_counter() - start) * 1000)
         data = sort_by_id_desc(data)
         payload = format_account_list(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -927,7 +966,7 @@ async def mastodon_following(
         latency_ms = int((time.perf_counter() - start) * 1000)
         data = sort_by_id_desc(data)
         payload = format_account_list(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -1018,10 +1057,10 @@ async def mastodon_notifications(
                 status = notif.get("status")
                 if not isinstance(status, dict):
                     continue
-                hint = compute_domain_hint(status, _PATTERNS, _field_projector)
+                hint = compute_domain_hint(status, _PATTERNS)
                 if hint is not None:
                     notif_hints[str(notif_id)] = hint
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=matched_total,
             returned=returned,
             filtered_by=filtered_by,
@@ -1064,7 +1103,7 @@ async def mastodon_trending_tags(
             tie_key=lambda r: r.get("name", "") if isinstance(r, dict) else "",
         )
         payload = format_trending_tags(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -1114,7 +1153,7 @@ async def mastodon_trending_statuses(
         data = sort_preserve_rank_tie_break_by(data, tie_key=_id_desc_tie)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -1157,7 +1196,7 @@ async def mastodon_trending_links(
             tie_key=lambda r: r.get("url", "") if isinstance(r, dict) else "",
         )
         payload = format_trending_links(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -1267,7 +1306,7 @@ async def mastodon_list_accounts(
         latency_ms = int((time.perf_counter() - start) * 1000)
         data = sort_by_id_desc(data)
         payload = format_account_list(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
