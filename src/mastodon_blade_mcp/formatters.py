@@ -10,10 +10,54 @@ All formatters return compact strings optimised for LLM consumption:
 from __future__ import annotations
 
 import html
-import json
 import re
 from collections.abc import Callable
 from typing import Any
+
+from stallari_mcp_helpers import append_meta as _lib_append_meta
+from stallari_mcp_helpers import meta_envelope as _lib_meta_envelope
+
+
+def meta_envelope(
+    *,
+    matched_total: int,
+    returned: int,
+    latency_ms: int,
+    filtered_by: list[str] | None = None,
+    redactions: list[str] | None = None,
+    next_cursor: str | None = None,
+    error_notes: list[str] | None = None,
+    domain_hints: dict[str, str] | None = None,
+) -> str:
+    """Typed re-export of ``stallari_mcp_helpers.meta_envelope``.
+
+    The upstream package ships without a ``py.typed`` marker (v0.1.0),
+    so mypy treats its return as ``Any``. This wrapper restores the
+    ``str`` annotation locally so callers don't trip ``no-any-return``.
+    """
+    return str(
+        _lib_meta_envelope(
+            matched_total=matched_total,
+            returned=returned,
+            latency_ms=latency_ms,
+            filtered_by=filtered_by,
+            redactions=redactions,
+            next_cursor=next_cursor,
+            error_notes=error_notes,
+            domain_hints=domain_hints,
+        )
+    )
+
+
+def append_meta(body: str, meta_line: str) -> str:
+    """Typed re-export of ``stallari_mcp_helpers.append_meta`` (see ``meta_envelope`` rationale)."""
+    return str(_lib_append_meta(body, meta_line))
+
+
+__all__ = [
+    "append_meta",
+    "meta_envelope",
+]
 
 # ---------------------------------------------------------------------------
 # HTML / text utilities
@@ -501,52 +545,6 @@ def format_media(media: dict[str, Any]) -> str:
     if desc:
         parts.append(f'alt="{truncate(desc, 100)}"')
     return " | ".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# DD-338 A.1 -- _meta envelope (JSON-tail wire shape)
-# ---------------------------------------------------------------------------
-
-
-def format_meta(
-    matched_total: int,
-    returned: int,
-    filtered_by: list[str],
-    redactions: list[str] | None = None,
-    next_cursor: str | None = None,
-    latency_ms: int = 0,
-    error_notes: list[str] | None = None,
-    domain_hints: dict[str, str] | None = None,
-) -> str:
-    """Render the canonical _meta JSON-tail block (DD-338 architect amendment).
-
-    Returns a single-line ``_meta: {...}`` string. Caller appends with ``\\n\\n``
-    separator after the existing formatted payload. Assembler regex is
-    ``\\n\\n_meta: (\\{.*\\})$`` -- the JSON value MUST be single-line.
-
-    DD-338 A.2.dom.c — when ``domain_hints`` is non-empty, an additional
-    ``domain_hints: {record_id: domain}`` entry is emitted. Empty / None ⇒
-    key omitted entirely (Convention #22 graceful degradation).
-    """
-    payload: dict[str, Any] = {
-        "matched_total": int(matched_total),
-        "returned": int(returned),
-        "filtered_by": list(filtered_by),
-        "redactions": list(redactions or []),
-        "next_cursor": next_cursor,
-        "latency_ms": int(latency_ms),
-    }
-    if error_notes:
-        payload["error_notes"] = list(error_notes)
-    if domain_hints:
-        payload["domain_hints"] = dict(domain_hints)
-    # Use canonical separators matching spec example: ', ' and ': '.
-    return "_meta: " + json.dumps(payload, ensure_ascii=False)
-
-
-def append_meta(payload: str, meta_block: str) -> str:
-    """Append a meta_block to an existing payload with the canonical separator."""
-    return f"{payload}\n\n{meta_block}"
 
 
 # ---------------------------------------------------------------------------

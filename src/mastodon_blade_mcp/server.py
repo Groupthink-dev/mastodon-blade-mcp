@@ -16,13 +16,13 @@ from typing import Annotated, Any
 
 from fastmcp import FastMCP
 from pydantic import Field
-
-from mastodon_blade_mcp.client import MastodonClient, MastodonError
-from mastodon_blade_mcp.domain_hint import (
+from stallari_mcp_helpers import (
     Pattern,
     compute_domain_hint,
     load_patterns_from_yaml,
 )
+
+from mastodon_blade_mcp.client import MastodonClient, MastodonError
 from mastodon_blade_mcp.formatters import (
     append_meta,
     format_account,
@@ -33,7 +33,6 @@ from mastodon_blade_mcp.formatters import (
     format_instance_info,
     format_lists,
     format_media,
-    format_meta,
     format_notifications,
     format_relationships,
     format_search_results,
@@ -42,6 +41,7 @@ from mastodon_blade_mcp.formatters import (
     format_trending_links,
     format_trending_tags,
     format_verify_credentials,
+    meta_envelope,
     sort_by_id_asc,
     sort_by_id_desc,
     sort_preserve_rank_tie_break_by,
@@ -135,53 +135,8 @@ def _load_blade_config(blade_id: str) -> list[Pattern]:
             content = f.read()
     except OSError:
         return []
-    return load_patterns_from_yaml(content)
-
-
-def _field_projector(record: dict[str, Any], field: str) -> Any:
-    """Project a logical field name onto a Mastodon status record.
-
-    Status records follow the shape returned by ``/api/v1/statuses/...`` and
-    ``/api/v1/timelines/...``::
-
-        {
-            "id": "12345",
-            "account": {"acct": "user@instance.example", ...},
-            "content": "<p>...</p>",
-            "tags": [{"name": "linux"}, ...],
-            "mentions": [{"acct": "user@instance.example"}, ...],
-            "spoiler_text": "..."
-        }
-
-    Recognised logical fields:
-        - ``account_acct``: scalar string -- author's webfinger acct
-        - ``tags``: list of tag names (strings)
-        - ``mentions``: list of mention acct handles (strings)
-        - ``content``: scalar string -- HTML content body (use ``contains``)
-        - ``spoiler_text``: scalar string -- content warning text
-
-    Unknown field names return ``None`` (no match in computer).
-    """
-    if field == "account_acct":
-        acct = record.get("account", {})
-        if isinstance(acct, dict):
-            return acct.get("acct")
-        return None
-    if field == "tags":
-        tags = record.get("tags", [])
-        if not isinstance(tags, list):
-            return None
-        return [t.get("name") for t in tags if isinstance(t, dict) and t.get("name") is not None]
-    if field == "mentions":
-        mentions = record.get("mentions", [])
-        if not isinstance(mentions, list):
-            return None
-        return [m.get("acct") for m in mentions if isinstance(m, dict) and m.get("acct") is not None]
-    if field == "content":
-        return record.get("content")
-    if field == "spoiler_text":
-        return record.get("spoiler_text")
-    return None
+    patterns: list[Pattern] = load_patterns_from_yaml(content)
+    return patterns
 
 
 # Module-level cache of patterns (loaded once at import time).
@@ -193,6 +148,10 @@ def _compute_domain_hints(records: list[dict[str, Any]]) -> dict[str, str]:
 
     Returns a ``{status_id: domain}`` mapping. Records that don't match any
     pattern are omitted (no key emitted). Empty when ``_PATTERNS`` is empty.
+
+    DD-338 Phase E.python: delegates to ``stallari_mcp_helpers.compute_domain_hint``
+    which uses dot-path field resolution (e.g. ``account.acct``) — the local
+    field-projector was retired in favour of canonical dot-path semantics.
     """
     if not _PATTERNS:
         return {}
@@ -203,7 +162,7 @@ def _compute_domain_hints(records: list[dict[str, Any]]) -> dict[str, str]:
         rec_id = rec.get("id")
         if rec_id is None:
             continue
-        hint = compute_domain_hint(rec, _PATTERNS, _field_projector)
+        hint = compute_domain_hint(rec, _PATTERNS)
         if hint is not None:
             out[str(rec_id)] = hint
     return out
@@ -347,7 +306,7 @@ async def mastodon_timeline_home(
         data = sort_by_id_desc(data)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -392,7 +351,7 @@ async def mastodon_timeline_public(
         data = sort_by_id_desc(data)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -436,7 +395,7 @@ async def mastodon_timeline_local(
         data = sort_by_id_desc(data)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -487,7 +446,7 @@ async def mastodon_timeline_hashtag(
         data = sort_by_id_desc(data)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -532,7 +491,7 @@ async def mastodon_timeline_list(
         data = sort_by_id_desc(data)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -598,7 +557,7 @@ async def mastodon_context(
         matched_total = len(all_statuses)
         payload = format_context(data)
         domain_hints = _compute_domain_hints(all_statuses)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=matched_total,
             returned=matched_total,
             filtered_by=filtered_by,
@@ -690,7 +649,7 @@ async def mastodon_search(
         )
         payload = format_search_results(data)
         domain_hints = _compute_domain_hints(list(data.get("statuses", []) or []))
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=matched_total,
             returned=returned,
             filtered_by=filtered_by,
@@ -786,7 +745,7 @@ async def mastodon_account_statuses(
             redactions.append(f"scope={norm_scope}_unconfigured")
     filtered_by.sort()
     if precondition_failed:
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=0,
             returned=0,
             filtered_by=filtered_by,
@@ -807,7 +766,7 @@ async def mastodon_account_statuses(
         data = sort_by_id_desc(data)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -847,7 +806,7 @@ async def mastodon_relationships(
         # DD-338 OQ-6: sort by id ascending for byte-deterministic ordering.
         data = sort_by_id_asc(data)
         payload = format_relationships(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -887,7 +846,7 @@ async def mastodon_followers(
         latency_ms = int((time.perf_counter() - start) * 1000)
         data = sort_by_id_desc(data)
         payload = format_account_list(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -927,7 +886,7 @@ async def mastodon_following(
         latency_ms = int((time.perf_counter() - start) * 1000)
         data = sort_by_id_desc(data)
         payload = format_account_list(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -1018,10 +977,10 @@ async def mastodon_notifications(
                 status = notif.get("status")
                 if not isinstance(status, dict):
                     continue
-                hint = compute_domain_hint(status, _PATTERNS, _field_projector)
+                hint = compute_domain_hint(status, _PATTERNS)
                 if hint is not None:
                     notif_hints[str(notif_id)] = hint
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=matched_total,
             returned=returned,
             filtered_by=filtered_by,
@@ -1064,7 +1023,7 @@ async def mastodon_trending_tags(
             tie_key=lambda r: r.get("name", "") if isinstance(r, dict) else "",
         )
         payload = format_trending_tags(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -1114,7 +1073,7 @@ async def mastodon_trending_statuses(
         data = sort_preserve_rank_tie_break_by(data, tie_key=_id_desc_tie)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -1157,7 +1116,7 @@ async def mastodon_trending_links(
             tie_key=lambda r: r.get("url", "") if isinstance(r, dict) else "",
         )
         payload = format_trending_links(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
@@ -1267,7 +1226,7 @@ async def mastodon_list_accounts(
         latency_ms = int((time.perf_counter() - start) * 1000)
         data = sort_by_id_desc(data)
         payload = format_account_list(data)
-        meta = format_meta(
+        meta = meta_envelope(
             matched_total=len(data),
             returned=len(data),
             filtered_by=filtered_by,
