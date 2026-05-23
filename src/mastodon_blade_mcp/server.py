@@ -377,11 +377,31 @@ async def mastodon_timeline_public(
 
     DD-338 B.1.b: returns statuses sorted by id descending (newest first);
     ordering is byte-deterministic across invocations.
+
+    DD-338 C W4: emits a ``_meta`` envelope describing the filter parameters,
+    sort order, and latency (assembler audit trail per DD-287 ContextPacket).
     """
+    filtered_by = [f"local={str(bool(local)).lower()}", f"limit={limit}", "sorted_by=id_desc"]
+    if max_id:
+        filtered_by.append(f"max_id={max_id}")
+    filtered_by.sort()
+    start = time.perf_counter()
     try:
         data = await _get_client().timeline_public(local, limit, max_id, instance)
+        latency_ms = int((time.perf_counter() - start) * 1000)
         data = sort_by_id_desc(data)
-        return format_timeline(data)
+        payload = format_timeline(data)
+        domain_hints = _compute_domain_hints(data)
+        meta = format_meta(
+            matched_total=len(data),
+            returned=len(data),
+            filtered_by=filtered_by,
+            redactions=[],
+            next_cursor=None,
+            latency_ms=latency_ms,
+            domain_hints=domain_hints or None,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
@@ -401,11 +421,31 @@ async def mastodon_timeline_local(
 
     DD-338 B.1.b: returns statuses sorted by id descending (newest first);
     ordering is byte-deterministic across invocations.
+
+    DD-338 C W4: emits a ``_meta`` envelope describing the filter parameters,
+    sort order, and latency (assembler audit trail per DD-287 ContextPacket).
     """
+    filtered_by = ["local=true", f"limit={limit}", "sorted_by=id_desc"]
+    if max_id:
+        filtered_by.append(f"max_id={max_id}")
+    filtered_by.sort()
+    start = time.perf_counter()
     try:
         data = await _get_client().timeline_public(local=True, limit=limit, max_id=max_id, instance=instance)
+        latency_ms = int((time.perf_counter() - start) * 1000)
         data = sort_by_id_desc(data)
-        return format_timeline(data)
+        payload = format_timeline(data)
+        domain_hints = _compute_domain_hints(data)
+        meta = format_meta(
+            matched_total=len(data),
+            returned=len(data),
+            filtered_by=filtered_by,
+            redactions=[],
+            next_cursor=None,
+            latency_ms=latency_ms,
+            domain_hints=domain_hints or None,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
@@ -427,11 +467,36 @@ async def mastodon_timeline_hashtag(
 
     DD-338 B.1.b: returns statuses sorted by id descending (newest first);
     ordering is byte-deterministic across invocations.
+
+    DD-338 C W4: emits a ``_meta`` envelope describing the filter parameters,
+    sort order, and latency (assembler audit trail per DD-287 ContextPacket).
     """
+    filtered_by = [
+        f"hashtag={hashtag}",
+        f"limit={limit}",
+        f"local={str(bool(local)).lower()}",
+        "sorted_by=id_desc",
+    ]
+    if max_id:
+        filtered_by.append(f"max_id={max_id}")
+    filtered_by.sort()
+    start = time.perf_counter()
     try:
         data = await _get_client().timeline_hashtag(hashtag, limit, max_id, local, instance)
+        latency_ms = int((time.perf_counter() - start) * 1000)
         data = sort_by_id_desc(data)
-        return format_timeline(data)
+        payload = format_timeline(data)
+        domain_hints = _compute_domain_hints(data)
+        meta = format_meta(
+            matched_total=len(data),
+            returned=len(data),
+            filtered_by=filtered_by,
+            redactions=[],
+            next_cursor=None,
+            latency_ms=latency_ms,
+            domain_hints=domain_hints or None,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
@@ -452,11 +517,31 @@ async def mastodon_timeline_list(
 
     DD-338 B.1.b: returns statuses sorted by id descending (newest first);
     ordering is byte-deterministic across invocations.
+
+    DD-338 C W4: emits a ``_meta`` envelope describing the filter parameters,
+    sort order, and latency (assembler audit trail per DD-287 ContextPacket).
     """
+    filtered_by = [f"limit={limit}", f"list_id={list_id}", "sorted_by=id_desc"]
+    if max_id:
+        filtered_by.append(f"max_id={max_id}")
+    filtered_by.sort()
+    start = time.perf_counter()
     try:
         data = await _get_client().timeline_list(list_id, limit, max_id, instance)
+        latency_ms = int((time.perf_counter() - start) * 1000)
         data = sort_by_id_desc(data)
-        return format_timeline(data)
+        payload = format_timeline(data)
+        domain_hints = _compute_domain_hints(data)
+        meta = format_meta(
+            matched_total=len(data),
+            returned=len(data),
+            filtered_by=filtered_by,
+            redactions=[],
+            next_cursor=None,
+            latency_ms=latency_ms,
+            domain_hints=domain_hints or None,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
@@ -489,10 +574,40 @@ async def mastodon_context(
     status_id: Annotated[str, Field(description="Status ID to get thread context for")],
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """Thread context -- ancestors and descendants of a status."""
+    """Thread context -- ancestors and descendants of a status.
+
+    DD-338 C W4 (OQ-6): ancestors + descendants are each sorted by id descending
+    to honestly meet the catalog ``deterministic_ordering: stable`` declaration.
+    Emits a ``_meta`` envelope describing the seed status, sort order, and
+    latency (assembler audit trail per DD-287 ContextPacket).
+    """
+    filtered_by = [f"status_id={status_id}", "sorted_by=id_desc"]
+    filtered_by.sort()
+    start = time.perf_counter()
     try:
         data = await _get_client().get_context(status_id, instance)
-        return format_context(data)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        # DD-338 OQ-6: sort each bucket independently for byte-deterministic ordering.
+        if isinstance(data, dict):
+            data = dict(data)
+            data["ancestors"] = sort_by_id_desc(list(data.get("ancestors", []) or []))
+            data["descendants"] = sort_by_id_desc(list(data.get("descendants", []) or []))
+        all_statuses: list[dict[str, Any]] = []
+        if isinstance(data, dict):
+            all_statuses = list(data.get("ancestors", []) or []) + list(data.get("descendants", []) or [])
+        matched_total = len(all_statuses)
+        payload = format_context(data)
+        domain_hints = _compute_domain_hints(all_statuses)
+        meta = format_meta(
+            matched_total=matched_total,
+            returned=matched_total,
+            filtered_by=filtered_by,
+            redactions=[],
+            next_cursor=None,
+            latency_ms=latency_ms,
+            domain_hints=domain_hints or None,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
@@ -716,10 +831,31 @@ async def mastodon_relationships(
     account_ids: Annotated[list[str], Field(description="List of account IDs to check relationships with")],
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """Check relationships with one or more accounts (following, blocked, muted, etc.)."""
+    """Check relationships with one or more accounts (following, blocked, muted, etc.).
+
+    DD-338 C W4 (OQ-6): relationships are sorted by id ascending (account-id
+    creation order) to honestly meet the catalog ``deterministic_ordering:
+    stable`` declaration. Emits a ``_meta`` envelope describing the input
+    cardinality, sort order, and latency (assembler audit trail per DD-287).
+    """
+    filtered_by = [f"account_ids={len(account_ids)}", "sorted_by=id_asc"]
+    filtered_by.sort()
+    start = time.perf_counter()
     try:
         data = await _get_client().get_relationships(account_ids, instance)
-        return format_relationships(data)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        # DD-338 OQ-6: sort by id ascending for byte-deterministic ordering.
+        data = sort_by_id_asc(data)
+        payload = format_relationships(data)
+        meta = format_meta(
+            matched_total=len(data),
+            returned=len(data),
+            filtered_by=filtered_by,
+            redactions=[],
+            next_cursor=None,
+            latency_ms=latency_ms,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
@@ -739,11 +875,27 @@ async def mastodon_followers(
 
     DD-338 B.1.b: returns accounts sorted by id descending (newest-followers
     first); ordering is byte-deterministic across invocations.
+
+    DD-338 C W4: emits a ``_meta`` envelope describing the filter parameters,
+    sort order, and latency (assembler audit trail per DD-287 ContextPacket).
     """
+    filtered_by = [f"account_id={account_id}", f"limit={limit}", "sorted_by=id_desc"]
+    filtered_by.sort()
+    start = time.perf_counter()
     try:
         data = await _get_client().get_followers(account_id, limit, instance)
+        latency_ms = int((time.perf_counter() - start) * 1000)
         data = sort_by_id_desc(data)
-        return format_account_list(data)
+        payload = format_account_list(data)
+        meta = format_meta(
+            matched_total=len(data),
+            returned=len(data),
+            filtered_by=filtered_by,
+            redactions=[],
+            next_cursor=None,
+            latency_ms=latency_ms,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
@@ -763,11 +915,27 @@ async def mastodon_following(
 
     DD-338 B.1.b: returns accounts sorted by id descending (newest-followed
     first); ordering is byte-deterministic across invocations.
+
+    DD-338 C W4: emits a ``_meta`` envelope describing the filter parameters,
+    sort order, and latency (assembler audit trail per DD-287 ContextPacket).
     """
+    filtered_by = [f"account_id={account_id}", f"limit={limit}", "sorted_by=id_desc"]
+    filtered_by.sort()
+    start = time.perf_counter()
     try:
         data = await _get_client().get_following(account_id, limit, instance)
+        latency_ms = int((time.perf_counter() - start) * 1000)
         data = sort_by_id_desc(data)
-        return format_account_list(data)
+        payload = format_account_list(data)
+        meta = format_meta(
+            matched_total=len(data),
+            returned=len(data),
+            filtered_by=filtered_by,
+            redactions=[],
+            next_cursor=None,
+            latency_ms=latency_ms,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
@@ -881,14 +1049,30 @@ async def mastodon_trending_tags(
 
     DD-338 B.1.b: preserves server-returned trending rank; ties break on
     ``name`` ascending for byte-deterministic ordering.
+
+    DD-338 C W4: emits a ``_meta`` envelope describing the limit, rank-preserve
+    sort discipline, and latency (assembler audit trail per DD-287).
     """
+    filtered_by = [f"limit={limit}", "sorted_by=server_rank;tie_name_asc"]
+    filtered_by.sort()
+    start = time.perf_counter()
     try:
         data = await _get_client().trending_tags(limit, instance)
+        latency_ms = int((time.perf_counter() - start) * 1000)
         data = sort_preserve_rank_tie_break_by(
             data,
             tie_key=lambda r: r.get("name", "") if isinstance(r, dict) else "",
         )
-        return format_trending_tags(data)
+        payload = format_trending_tags(data)
+        meta = format_meta(
+            matched_total=len(data),
+            returned=len(data),
+            filtered_by=filtered_by,
+            redactions=[],
+            next_cursor=None,
+            latency_ms=latency_ms,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
@@ -907,9 +1091,16 @@ async def mastodon_trending_statuses(
 
     DD-338 B.1.b: preserves server-returned trending rank; ties break on
     ``id`` descending (snowflake newer-first) for byte-deterministic ordering.
+
+    DD-338 C W4: emits a ``_meta`` envelope describing the limit, rank-preserve
+    sort discipline, and latency (assembler audit trail per DD-287).
     """
+    filtered_by = [f"limit={limit}", "sorted_by=server_rank;tie_id_desc"]
+    filtered_by.sort()
+    start = time.perf_counter()
     try:
         data = await _get_client().trending_statuses(limit, instance)
+        latency_ms = int((time.perf_counter() - start) * 1000)
 
         def _id_desc_tie(rec: dict[str, Any]) -> int:
             raw = rec.get("id") if isinstance(rec, dict) else None
@@ -921,7 +1112,18 @@ async def mastodon_trending_statuses(
                 return 0
 
         data = sort_preserve_rank_tie_break_by(data, tie_key=_id_desc_tie)
-        return format_timeline(data)
+        payload = format_timeline(data)
+        domain_hints = _compute_domain_hints(data)
+        meta = format_meta(
+            matched_total=len(data),
+            returned=len(data),
+            filtered_by=filtered_by,
+            redactions=[],
+            next_cursor=None,
+            latency_ms=latency_ms,
+            domain_hints=domain_hints or None,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
@@ -940,14 +1142,30 @@ async def mastodon_trending_links(
 
     DD-338 B.1.b: preserves server-returned trending rank; ties break on
     ``url`` ascending for byte-deterministic ordering.
+
+    DD-338 C W4: emits a ``_meta`` envelope describing the limit, rank-preserve
+    sort discipline, and latency (assembler audit trail per DD-287).
     """
+    filtered_by = [f"limit={limit}", "sorted_by=server_rank;tie_url_asc"]
+    filtered_by.sort()
+    start = time.perf_counter()
     try:
         data = await _get_client().trending_links(limit, instance)
+        latency_ms = int((time.perf_counter() - start) * 1000)
         data = sort_preserve_rank_tie_break_by(
             data,
             tie_key=lambda r: r.get("url", "") if isinstance(r, dict) else "",
         )
-        return format_trending_links(data)
+        payload = format_trending_links(data)
+        meta = format_meta(
+            matched_total=len(data),
+            returned=len(data),
+            filtered_by=filtered_by,
+            redactions=[],
+            next_cursor=None,
+            latency_ms=latency_ms,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
@@ -1037,11 +1255,27 @@ async def mastodon_list_accounts(
 
     DD-338 B.1.b: returns accounts sorted by id descending; ordering is
     byte-deterministic across invocations.
+
+    DD-338 C W4: emits a ``_meta`` envelope describing the filter parameters,
+    sort order, and latency (assembler audit trail per DD-287 ContextPacket).
     """
+    filtered_by = [f"limit={limit}", f"list_id={list_id}", "sorted_by=id_desc"]
+    filtered_by.sort()
+    start = time.perf_counter()
     try:
         data = await _get_client().get_list_accounts(list_id, limit, instance)
+        latency_ms = int((time.perf_counter() - start) * 1000)
         data = sort_by_id_desc(data)
-        return format_account_list(data)
+        payload = format_account_list(data)
+        meta = format_meta(
+            matched_total=len(data),
+            returned=len(data),
+            filtered_by=filtered_by,
+            redactions=[],
+            next_cursor=None,
+            latency_ms=latency_ms,
+        )
+        return append_meta(payload, meta)
     except MastodonError as e:
         return _error(e)
 
