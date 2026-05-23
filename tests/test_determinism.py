@@ -27,6 +27,7 @@ from tests.conftest import (
     make_filter_entry,
     make_list_entry,
     make_notification,
+    make_relationship,
     make_status,
     make_trending_tag,
 )
@@ -137,6 +138,34 @@ def _shuffled_trending_links(seed_base: int = 0, n: int = 5) -> list[dict[str, A
     return fixture
 
 
+def _shuffled_context(seed_base: int = 0) -> dict[str, list[dict[str, Any]]]:
+    """Build a thread-context dict (ancestors + descendants) with shuffled buckets.
+
+    DD-338 C W4 (OQ-6): mastodon_context sorts each bucket independently by
+    id descending. Shuffling each bucket per-call drives the byte-equal
+    determinism gate: a non-sorting implementation would diverge.
+    """
+    ancestors = [make_status(status_id=i) for i in ("109876543210", "109876543220", "109876543230")]
+    descendants = [make_status(status_id=i) for i in ("109876543310", "109876543320", "109876543330")]
+    rng_a = random.Random(seed_base + 11)
+    rng_a.shuffle(ancestors)
+    rng_d = random.Random(seed_base + 13)
+    rng_d.shuffle(descendants)
+    return {"ancestors": ancestors, "descendants": descendants}
+
+
+def _shuffled_relationships(seed_base: int = 0, n: int = 5) -> list[dict[str, Any]]:
+    """Build N relationships with distinct int-castable ids, shuffled by seed_base.
+
+    DD-338 C W4 (OQ-6): mastodon_relationships sorts by id ascending.
+    """
+    ids = ["10001", "10002", "10003", "10004", "10005"][:n]
+    fixture = [make_relationship(account_id=i) for i in ids]
+    rng = random.Random(seed_base)
+    rng.shuffle(fixture)
+    return fixture
+
+
 def _shuffled_search_buckets(seed_base: int = 0) -> dict[str, list[dict[str, Any]]]:
     """Three-bucket search fixture with shuffled accounts/statuses/hashtags."""
     accounts = _shuffled_accounts(seed_base + 1, n=3)
@@ -189,6 +218,10 @@ _TOOL_CONFIGS: list[tuple[str, str, bool, Any]] = [
     ("mastodon_list_accounts", "get_list_accounts", False, _shuffled_accounts),
     ("mastodon_conversations", "get_conversations", False, _shuffled_conversations),
     ("mastodon_filters", "get_filters", False, _shuffled_filters),
+    # DD-338 C W4 -- mastodon_context + mastodon_relationships gain sort under
+    # OQ-6; add to N=5 byte-equal determinism harness.
+    ("mastodon_context", "get_context", False, _shuffled_context),
+    ("mastodon_relationships", "get_relationships", False, _shuffled_relationships),
 ]
 
 
@@ -259,6 +292,10 @@ async def test_n5_byte_identical(
                 result = await tool_fn("list-1")
             elif tool_name == "mastodon_list_accounts":
                 result = await tool_fn("list-1")
+            elif tool_name == "mastodon_context":
+                result = await tool_fn("109876543210")
+            elif tool_name == "mastodon_relationships":
+                result = await tool_fn(["10001", "10002"])
             else:
                 result = await tool_fn()
             payloads.append(result)

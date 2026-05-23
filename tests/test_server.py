@@ -879,3 +879,347 @@ class TestPerInstanceEnvVarSuffix:
             mock_gc.return_value = mock_client
             await server_module.mastodon_timeline_home(scope="personal", instance="hachyderm")
             mock_client.timeline_list_paginated.assert_awaited_once_with("instance-list", 20, None, "hachyderm")
+
+
+# ===========================================================================
+# DD-338 C W4 -- _meta envelope shape + filtered_by content tests
+# ===========================================================================
+
+
+_W4_REQUIRED_META_KEYS = ("matched_total", "returned", "filtered_by", "redactions", "next_cursor", "latency_ms")
+
+
+def _assert_meta_shape(meta: dict) -> None:
+    """Assert the canonical _meta envelope shape for a W4-promoted tool."""
+    for key in _W4_REQUIRED_META_KEYS:
+        assert key in meta, f"missing _meta key: {key}"
+    assert isinstance(meta["matched_total"], int)
+    assert isinstance(meta["returned"], int)
+    assert isinstance(meta["filtered_by"], list)
+    assert isinstance(meta["redactions"], list)
+    assert isinstance(meta["latency_ms"], int)
+
+
+class TestW4MastodonTimelinePublic:
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.timeline_public.return_value = [make_status()]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_timeline_public()
+            meta = _parse_meta(result)
+            _assert_meta_shape(meta)
+
+    @pytest.mark.asyncio
+    async def test_filtered_by_content(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.timeline_public.return_value = [make_status()]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_timeline_public(local=True, limit=10, max_id="999")
+            meta = _parse_meta(result)
+            assert "local=true" in meta["filtered_by"]
+            assert "limit=10" in meta["filtered_by"]
+            assert "max_id=999" in meta["filtered_by"]
+            assert "sorted_by=id_desc" in meta["filtered_by"]
+            assert meta["filtered_by"] == sorted(meta["filtered_by"])
+
+
+class TestW4MastodonTimelineLocal:
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.timeline_public.return_value = [make_status()]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_timeline_local()
+            meta = _parse_meta(result)
+            _assert_meta_shape(meta)
+
+    @pytest.mark.asyncio
+    async def test_filtered_by_content(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.timeline_public.return_value = [make_status()]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_timeline_local(limit=15)
+            meta = _parse_meta(result)
+            assert "local=true" in meta["filtered_by"]
+            assert "limit=15" in meta["filtered_by"]
+            assert "sorted_by=id_desc" in meta["filtered_by"]
+
+
+class TestW4MastodonTimelineHashtag:
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.timeline_hashtag.return_value = [make_status()]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_timeline_hashtag("python")
+            meta = _parse_meta(result)
+            _assert_meta_shape(meta)
+
+    @pytest.mark.asyncio
+    async def test_filtered_by_content(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.timeline_hashtag.return_value = [make_status()]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_timeline_hashtag("rust", limit=5, local=True)
+            meta = _parse_meta(result)
+            assert "hashtag=rust" in meta["filtered_by"]
+            assert "limit=5" in meta["filtered_by"]
+            assert "local=true" in meta["filtered_by"]
+            assert "sorted_by=id_desc" in meta["filtered_by"]
+
+
+class TestW4MastodonTimelineList:
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.timeline_list.return_value = [make_status()]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_timeline_list("list-1")
+            meta = _parse_meta(result)
+            _assert_meta_shape(meta)
+
+    @pytest.mark.asyncio
+    async def test_filtered_by_content(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.timeline_list.return_value = [make_status()]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_timeline_list("list-42", limit=30)
+            meta = _parse_meta(result)
+            assert "list_id=list-42" in meta["filtered_by"]
+            assert "limit=30" in meta["filtered_by"]
+            assert "sorted_by=id_desc" in meta["filtered_by"]
+
+
+class TestW4MastodonContext:
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_context.return_value = {
+                "ancestors": [make_status(status_id="anc-1")],
+                "descendants": [make_status(status_id="desc-1")],
+            }
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_context("test-id")
+            meta = _parse_meta(result)
+            _assert_meta_shape(meta)
+
+    @pytest.mark.asyncio
+    async def test_filtered_by_content(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_context.return_value = {"ancestors": [], "descendants": []}
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_context("seed-42")
+            meta = _parse_meta(result)
+            assert "status_id=seed-42" in meta["filtered_by"]
+            assert "sorted_by=id_desc" in meta["filtered_by"]
+
+    @pytest.mark.asyncio
+    async def test_sort_applied(self, mastodon_env: None) -> None:
+        # OQ-6: confirm sort_by_id_desc is applied to each bucket.
+        # Status format begins each line with `<id> | ...`.
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_context.return_value = {
+                "ancestors": [make_status(status_id="100"), make_status(status_id="200")],
+                "descendants": [make_status(status_id="300"), make_status(status_id="400")],
+            }
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_context("seed")
+            # newest-first within ancestors bucket: 200 before 100
+            assert result.index("200 |") < result.index("100 |")
+            # newest-first within descendants bucket: 400 before 300
+            assert result.index("400 |") < result.index("300 |")
+
+
+class TestW4MastodonRelationships:
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_relationships.return_value = [make_relationship()]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_relationships(["12345"])
+            meta = _parse_meta(result)
+            _assert_meta_shape(meta)
+
+    @pytest.mark.asyncio
+    async def test_filtered_by_content(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_relationships.return_value = []
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_relationships(["1", "2", "3"])
+            meta = _parse_meta(result)
+            assert "account_ids=3" in meta["filtered_by"]
+            assert "sorted_by=id_asc" in meta["filtered_by"]
+
+    @pytest.mark.asyncio
+    async def test_sort_applied(self, mastodon_env: None) -> None:
+        # OQ-6: confirm sort_by_id_asc is applied (id ascending).
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_relationships.return_value = [
+                make_relationship(account_id="300"),
+                make_relationship(account_id="100"),
+                make_relationship(account_id="200"),
+            ]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_relationships(["100", "200", "300"])
+            # ascending: 100 before 200 before 300
+            i1 = result.index("100")
+            i2 = result.index("200")
+            i3 = result.index("300")
+            assert i1 < i2 < i3
+
+
+class TestW4MastodonFollowers:
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_followers.return_value = [make_account()]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_followers("12345")
+            meta = _parse_meta(result)
+            _assert_meta_shape(meta)
+
+    @pytest.mark.asyncio
+    async def test_filtered_by_content(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_followers.return_value = []
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_followers("acc-1", limit=80)
+            meta = _parse_meta(result)
+            assert "account_id=acc-1" in meta["filtered_by"]
+            assert "limit=80" in meta["filtered_by"]
+            assert "sorted_by=id_desc" in meta["filtered_by"]
+
+
+class TestW4MastodonFollowing:
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_following.return_value = [make_account()]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_following("12345")
+            meta = _parse_meta(result)
+            _assert_meta_shape(meta)
+
+    @pytest.mark.asyncio
+    async def test_filtered_by_content(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_following.return_value = []
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_following("acc-2", limit=50)
+            meta = _parse_meta(result)
+            assert "account_id=acc-2" in meta["filtered_by"]
+            assert "limit=50" in meta["filtered_by"]
+
+
+class TestW4MastodonListAccounts:
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_list_accounts.return_value = [make_account()]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_list_accounts("list-1")
+            meta = _parse_meta(result)
+            _assert_meta_shape(meta)
+
+    @pytest.mark.asyncio
+    async def test_filtered_by_content(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.get_list_accounts.return_value = []
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_list_accounts("list-7", limit=60)
+            meta = _parse_meta(result)
+            assert "list_id=list-7" in meta["filtered_by"]
+            assert "limit=60" in meta["filtered_by"]
+            assert "sorted_by=id_desc" in meta["filtered_by"]
+
+
+class TestW4MastodonTrendingTags:
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.trending_tags.return_value = [make_trending_tag()]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_trending_tags()
+            meta = _parse_meta(result)
+            _assert_meta_shape(meta)
+
+    @pytest.mark.asyncio
+    async def test_filtered_by_content(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.trending_tags.return_value = []
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_trending_tags(limit=25)
+            meta = _parse_meta(result)
+            assert "limit=25" in meta["filtered_by"]
+            assert "sorted_by=server_rank;tie_name_asc" in meta["filtered_by"]
+
+
+class TestW4MastodonTrendingStatuses:
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.trending_statuses.return_value = [make_status()]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_trending_statuses()
+            meta = _parse_meta(result)
+            _assert_meta_shape(meta)
+
+    @pytest.mark.asyncio
+    async def test_filtered_by_content(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.trending_statuses.return_value = []
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_trending_statuses(limit=15)
+            meta = _parse_meta(result)
+            assert "limit=15" in meta["filtered_by"]
+            assert "sorted_by=server_rank;tie_id_desc" in meta["filtered_by"]
+
+
+class TestW4MastodonTrendingLinks:
+    @pytest.mark.asyncio
+    async def test_meta_envelope_shape(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.trending_links.return_value = [
+                {"title": "X", "url": "https://example.com/x", "history": []},
+            ]
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_trending_links()
+            meta = _parse_meta(result)
+            _assert_meta_shape(meta)
+
+    @pytest.mark.asyncio
+    async def test_filtered_by_content(self, mastodon_env: None) -> None:
+        with patch.object(server_module, "_get_client") as mock_gc:
+            mock_client = AsyncMock()
+            mock_client.trending_links.return_value = []
+            mock_gc.return_value = mock_client
+            result = await server_module.mastodon_trending_links(limit=12)
+            meta = _parse_meta(result)
+            assert "limit=12" in meta["filtered_by"]
+            assert "sorted_by=server_rank;tie_url_asc" in meta["filtered_by"]
