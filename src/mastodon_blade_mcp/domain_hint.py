@@ -124,7 +124,7 @@ def load_patterns_from_yaml(yaml_str: str) -> list[Pattern]:
     if not yaml_str.strip():
         return []
     try:
-        import yaml
+        import yaml  # type: ignore[import-untyped]
     except ImportError:
         logger.warning("pyyaml not installed; domain_hint patterns disabled")
         return []
