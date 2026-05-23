@@ -15,9 +15,25 @@ Stallari platform (`major.macro.minor.patch`).
   change for callers. Wire-shape: `_meta.filtered_by` now alphabetically sorted
   by the canonical builder; JSON separators tightened (already tight here so
   no diff).
-- Engine semantics: `compute_domain_hint` now uses canonical dot-path field
-  resolution (e.g. `account.acct`) instead of a per-blade field projector.
-  Existing YAML configs that relied on the projector's logical field names
-  (`account_acct`, `tags`, `mentions`) need to be re-authored against the
-  dot-path schema. The DD-338 A.2.dom.a substrate has not yet shipped
-  user-facing pattern configs, so no in-the-wild migration is required.
+- Engine semantics: `compute_domain_hint` is now a Mastodon-specific local
+  wrapper in `server.py` that pre-projects each pattern's referenced field
+  via `_field_projector` and then delegates to
+  `stallari_mcp_helpers.compute_domain_hint` (canonical 2-arg). The wrapper
+  preserves the 3-arg shape the blade has used since DD-338 A.2.dom.c so
+  existing call-sites and tests don't change. Logical field names
+  (`account_acct`, `tags`, `mentions`, `content`, `spoiler_text`) continue
+  to resolve correctly against list-of-dict record shapes that the
+  canonical lib's dot-path navigation alone cannot address.
+
+### Fixed
+- **Architect-review correction (post-merge of the original Spec B Cluster
+  C flip):** restore `_field_projector` and add a local
+  `compute_domain_hint` wrapper. The original flip dropped the projector
+  and delegated directly to the canonical 2-arg helper — that produced a
+  silent behavioural regression for `tags = [{"name": ...}]` and
+  `mentions = [{"acct": ...}]` patterns, because the canonical lib's
+  `_matches` helper explicitly skips dict-shaped list elements
+  (`if isinstance(c, dict): continue`). Mirrors the pattern landed in
+  `home-assistant-blade-mcp` PR #5. Restored `tests/test_domain_hint.py`
+  covering list-of-dict projection, first-match ordering, glob/contains/equals
+  ops, and the wrapper's default-projector arg.

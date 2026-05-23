@@ -12,14 +12,17 @@ import logging
 import os
 import re
 import time
+from collections.abc import Callable
 from typing import Annotated, Any
 
 from fastmcp import FastMCP
 from pydantic import Field
 from stallari_mcp_helpers import (
     Pattern,
-    compute_domain_hint,
     load_patterns_from_yaml,
+)
+from stallari_mcp_helpers import (
+    compute_domain_hint as _canonical_compute_domain_hint,
 )
 
 from mastodon_blade_mcp.client import MastodonClient, MastodonError
@@ -139,8 +142,89 @@ def _load_blade_config(blade_id: str) -> list[Pattern]:
     return patterns
 
 
+def _field_projector(record: dict[str, Any], field: str) -> Any:
+    """Project a logical field name onto a Mastodon status record.
+
+    Status records follow the shape returned by ``/api/v1/statuses/...`` and
+    ``/api/v1/timelines/...``::
+
+        {
+            "id": "12345",
+            "account": {"acct": "user@instance.example", ...},
+            "content": "<p>...</p>",
+            "tags": [{"name": "linux"}, ...],
+            "mentions": [{"acct": "user@instance.example"}, ...],
+            "spoiler_text": "..."
+        }
+
+    Recognised logical fields:
+        - ``account_acct``: scalar string -- author's webfinger acct
+        - ``tags``: list of tag names (strings)
+        - ``mentions``: list of mention acct handles (strings)
+        - ``content``: scalar string -- HTML content body (use ``contains``)
+        - ``spoiler_text``: scalar string -- content warning text
+
+    Unknown field names return ``None`` (no match in computer).
+    """
+    if field == "account_acct":
+        acct = record.get("account", {})
+        if isinstance(acct, dict):
+            return acct.get("acct")
+        return None
+    if field == "tags":
+        tags = record.get("tags", [])
+        if not isinstance(tags, list):
+            return None
+        return [t.get("name") for t in tags if isinstance(t, dict) and t.get("name") is not None]
+    if field == "mentions":
+        mentions = record.get("mentions", [])
+        if not isinstance(mentions, list):
+            return None
+        return [m.get("acct") for m in mentions if isinstance(m, dict) and m.get("acct") is not None]
+    if field == "content":
+        return record.get("content")
+    if field == "spoiler_text":
+        return record.get("spoiler_text")
+    return None
+
+
 # Module-level cache of patterns (loaded once at import time).
 _PATTERNS: list[Pattern] = _load_blade_config("mastodon-blade-mcp")
+
+
+def compute_domain_hint(
+    record: dict[str, Any],
+    patterns: list[Pattern],
+    field_projector: Callable[[dict[str, Any], str], Any] = _field_projector,
+) -> str | None:
+    """Mastodon-specific wrapper around the canonical ``compute_domain_hint``.
+
+    Bridges the canonical dot-path field-resolution model to Mastodon's
+    record-shape projector. Mastodon status records carry list-of-dict
+    shapes (``tags = [{"name": ...}, ...]``, ``mentions = [{"acct": ...}, ...]``)
+    that the canonical lib's dot-path navigation cannot address — its
+    ``_matches`` helper explicitly skips ``dict``-shaped list elements.
+    We pre-project each pattern's referenced field via ``field_projector``
+    and seed the result as a top-level key on a copy of the record so
+    canonical sees a uniform flat shape.
+
+    Authored against the same three-arg shape the blade has used since
+    DD-338 A.2.dom.c so existing tests + callers don't change.
+    """
+    if not patterns:
+        return None
+    projected = dict(record)
+    seen: set[str] = set()
+    for pattern in patterns:
+        field = pattern.field
+        if field in seen:
+            continue
+        seen.add(field)
+        value = field_projector(record, field)
+        if value is not None:
+            projected[field] = value
+    result: str | None = _canonical_compute_domain_hint(projected, patterns)
+    return result
 
 
 def _compute_domain_hints(records: list[dict[str, Any]]) -> dict[str, str]:
@@ -148,10 +232,6 @@ def _compute_domain_hints(records: list[dict[str, Any]]) -> dict[str, str]:
 
     Returns a ``{status_id: domain}`` mapping. Records that don't match any
     pattern are omitted (no key emitted). Empty when ``_PATTERNS`` is empty.
-
-    DD-338 Phase E.python: delegates to ``stallari_mcp_helpers.compute_domain_hint``
-    which uses dot-path field resolution (e.g. ``account.acct``) — the local
-    field-projector was retired in favour of canonical dot-path semantics.
     """
     if not _PATTERNS:
         return {}
@@ -162,7 +242,7 @@ def _compute_domain_hints(records: list[dict[str, Any]]) -> dict[str, str]:
         rec_id = rec.get("id")
         if rec_id is None:
             continue
-        hint = compute_domain_hint(rec, _PATTERNS)
+        hint = compute_domain_hint(rec, _PATTERNS, _field_projector)
         if hint is not None:
             out[str(rec_id)] = hint
     return out
