@@ -42,6 +42,9 @@ from mastodon_blade_mcp.formatters import (
     format_trending_links,
     format_trending_tags,
     format_verify_credentials,
+    sort_by_id_asc,
+    sort_by_id_desc,
+    sort_preserve_rank_tie_break_by,
 )
 from mastodon_blade_mcp.models import (
     check_confirm_gate,
@@ -313,6 +316,9 @@ async def mastodon_timeline_home(
     DD-338 A.1: when scope ∈ {personal,family,work} and the matching list-id env var
     resolves, the request swaps to /api/v1/timelines/list/{list_id}. Unset env var
     degrades to passthrough with _meta.redactions: ["scope=<scope>_unconfigured"].
+
+    DD-338 B.1.b: returns statuses sorted by id descending (newest first);
+    ordering is byte-deterministic across invocations.
     """
     norm_scope, scope_err = _validate_scope(scope)
     if scope_err:
@@ -329,6 +335,7 @@ async def mastodon_timeline_home(
     filtered_by.append(f"limit={limit}")
     if max_id:
         filtered_by.append(f"max_id={max_id}")
+    filtered_by.append("sorted_by=id_desc")
     filtered_by.sort()
     start = time.perf_counter()
     try:
@@ -337,6 +344,7 @@ async def mastodon_timeline_home(
         else:
             data, next_cursor = await _get_client().timeline_home_paginated(limit, max_id, instance)
         latency_ms = int((time.perf_counter() - start) * 1000)
+        data = sort_by_id_desc(data)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
         meta = format_meta(
@@ -365,9 +373,14 @@ async def mastodon_timeline_public(
     max_id: Annotated[str | None, Field(description="Return statuses older than this ID (pagination)")] = None,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """Public (federated) timeline. Set local=true for local-only."""
+    """Public (federated) timeline. Set local=true for local-only.
+
+    DD-338 B.1.b: returns statuses sorted by id descending (newest first);
+    ordering is byte-deterministic across invocations.
+    """
     try:
         data = await _get_client().timeline_public(local, limit, max_id, instance)
+        data = sort_by_id_desc(data)
         return format_timeline(data)
     except MastodonError as e:
         return _error(e)
@@ -384,9 +397,14 @@ async def mastodon_timeline_local(
     max_id: Annotated[str | None, Field(description="Return statuses older than this ID (pagination)")] = None,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """Local instance timeline (convenience wrapper for public timeline with local=true)."""
+    """Local instance timeline (convenience wrapper for public timeline with local=true).
+
+    DD-338 B.1.b: returns statuses sorted by id descending (newest first);
+    ordering is byte-deterministic across invocations.
+    """
     try:
         data = await _get_client().timeline_public(local=True, limit=limit, max_id=max_id, instance=instance)
+        data = sort_by_id_desc(data)
         return format_timeline(data)
     except MastodonError as e:
         return _error(e)
@@ -405,9 +423,14 @@ async def mastodon_timeline_hashtag(
     local: Annotated[bool, Field(description="Show only local instance statuses")] = False,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """Hashtag timeline -- statuses tagged with a specific hashtag."""
+    """Hashtag timeline -- statuses tagged with a specific hashtag.
+
+    DD-338 B.1.b: returns statuses sorted by id descending (newest first);
+    ordering is byte-deterministic across invocations.
+    """
     try:
         data = await _get_client().timeline_hashtag(hashtag, limit, max_id, local, instance)
+        data = sort_by_id_desc(data)
         return format_timeline(data)
     except MastodonError as e:
         return _error(e)
@@ -425,9 +448,14 @@ async def mastodon_timeline_list(
     max_id: Annotated[str | None, Field(description="Return statuses older than this ID (pagination)")] = None,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """List timeline -- statuses from accounts in a specific list."""
+    """List timeline -- statuses from accounts in a specific list.
+
+    DD-338 B.1.b: returns statuses sorted by id descending (newest first);
+    ordering is byte-deterministic across invocations.
+    """
     try:
         data = await _get_client().timeline_list(list_id, limit, max_id, instance)
+        data = sort_by_id_desc(data)
         return format_timeline(data)
     except MastodonError as e:
         return _error(e)
@@ -496,6 +524,10 @@ async def mastodon_search(
     DD-338 A.1: when scope ∈ {personal,family,work} and the matching list-id env var
     resolves, the ``statuses`` portion of results is filtered to authors in the list.
     Accounts and hashtags are not scope-filtered (scope vocabulary doesn't apply).
+
+    DD-338 B.1.b: each result bucket is sorted independently for byte-deterministic
+    ordering -- accounts and statuses by id descending; hashtags alphabetically by
+    name.
     """
     norm_scope, scope_err = _validate_scope(scope)
     if scope_err:
@@ -516,6 +548,7 @@ async def mastodon_search(
                 redactions.append("list_membership_unavailable")
         else:
             redactions.append(f"scope={norm_scope}_unconfigured")
+    filtered_by.append("sorted_by=id_desc:accounts,statuses;name_asc:hashtags")
     filtered_by.sort()
     start = time.perf_counter()
     try:
@@ -527,6 +560,14 @@ async def mastodon_search(
             filtered_statuses = [s for s in statuses if str(s.get("account", {}).get("id", "")) in member_ids]
             data = dict(data)
             data["statuses"] = filtered_statuses
+        # DD-338 B.1.b: per-bucket sort (after scope-filter, before format).
+        data = dict(data)
+        data["accounts"] = sort_by_id_desc(list(data.get("accounts", []) or []))
+        data["statuses"] = sort_by_id_desc(list(data.get("statuses", []) or []))
+        data["hashtags"] = sorted(
+            list(data.get("hashtags", []) or []),
+            key=lambda h: h.get("name", "") if isinstance(h, dict) else "",
+        )
         returned = (
             len(data.get("accounts", []) or [])
             + len(data.get("statuses", []) or [])
@@ -596,6 +637,9 @@ async def mastodon_account_statuses(
     DD-338 A.1: scope is a membership *precondition* (not a result filter) -- if
     ``account_id`` is not in the scope's list, returns an Error with
     ``_meta.redactions: ["account_outside_scope"]``.
+
+    DD-338 B.1.b: returns statuses sorted by id descending (newest first);
+    ordering is byte-deterministic across invocations.
     """
     norm_scope, scope_err = _validate_scope(scope)
     if scope_err:
@@ -607,6 +651,7 @@ async def mastodon_account_statuses(
         filtered_by.append("only_media=true")
     if pinned:
         filtered_by.append("pinned=true")
+    filtered_by.append("sorted_by=id_desc")
     redactions: list[str] = []
     precondition_failed = False
     list_id: str | None = None
@@ -644,6 +689,7 @@ async def mastodon_account_statuses(
             account_id, limit, max_id, exclude_reblogs, only_media, pinned, instance
         )
         latency_ms = int((time.perf_counter() - start) * 1000)
+        data = sort_by_id_desc(data)
         payload = format_timeline(data)
         domain_hints = _compute_domain_hints(data)
         meta = format_meta(
@@ -689,9 +735,14 @@ async def mastodon_followers(
     limit: Annotated[int, Field(description="Max results")] = 40,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """List followers of an account."""
+    """List followers of an account.
+
+    DD-338 B.1.b: returns accounts sorted by id descending (newest-followers
+    first); ordering is byte-deterministic across invocations.
+    """
     try:
         data = await _get_client().get_followers(account_id, limit, instance)
+        data = sort_by_id_desc(data)
         return format_account_list(data)
     except MastodonError as e:
         return _error(e)
@@ -708,9 +759,14 @@ async def mastodon_following(
     limit: Annotated[int, Field(description="Max results")] = 40,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """List accounts followed by an account."""
+    """List accounts followed by an account.
+
+    DD-338 B.1.b: returns accounts sorted by id descending (newest-followed
+    first); ordering is byte-deterministic across invocations.
+    """
     try:
         data = await _get_client().get_following(account_id, limit, instance)
+        data = sort_by_id_desc(data)
         return format_account_list(data)
     except MastodonError as e:
         return _error(e)
@@ -745,6 +801,9 @@ async def mastodon_notifications(
 
     DD-338 A.1: scope filters by the notification's *actor* (the account who
     mentioned/favourited/followed/etc the authenticated user), not by status author.
+
+    DD-338 B.1.b: returns notifications sorted by id descending (newest first);
+    ordering is byte-deterministic across invocations.
     """
     norm_scope, scope_err = _validate_scope(scope)
     if scope_err:
@@ -765,6 +824,7 @@ async def mastodon_notifications(
                 redactions.append("list_membership_unavailable")
         else:
             redactions.append(f"scope={norm_scope}_unconfigured")
+    filtered_by.append("sorted_by=id_desc")
     filtered_by.sort()
     start = time.perf_counter()
     try:
@@ -773,6 +833,7 @@ async def mastodon_notifications(
         matched_total = len(data)
         if member_ids is not None:
             data = [n for n in data if str(n.get("account", {}).get("id", "")) in member_ids]
+        data = sort_by_id_desc(data)
         returned = len(data)
         payload = format_notifications(data)
         # Domain hints: prefer the embedded status (when present) for hint
@@ -816,9 +877,17 @@ async def mastodon_trending_tags(
     limit: Annotated[int, Field(description="Max results")] = 10,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """Trending hashtags on the instance."""
+    """Trending hashtags on the instance.
+
+    DD-338 B.1.b: preserves server-returned trending rank; ties break on
+    ``name`` ascending for byte-deterministic ordering.
+    """
     try:
         data = await _get_client().trending_tags(limit, instance)
+        data = sort_preserve_rank_tie_break_by(
+            data,
+            tie_key=lambda r: r.get("name", "") if isinstance(r, dict) else "",
+        )
         return format_trending_tags(data)
     except MastodonError as e:
         return _error(e)
@@ -834,9 +903,24 @@ async def mastodon_trending_statuses(
     limit: Annotated[int, Field(description="Max results")] = 20,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """Trending statuses on the instance."""
+    """Trending statuses on the instance.
+
+    DD-338 B.1.b: preserves server-returned trending rank; ties break on
+    ``id`` descending (snowflake newer-first) for byte-deterministic ordering.
+    """
     try:
         data = await _get_client().trending_statuses(limit, instance)
+
+        def _id_desc_tie(rec: dict[str, Any]) -> int:
+            raw = rec.get("id") if isinstance(rec, dict) else None
+            if raw is None:
+                return 0
+            try:
+                return -int(raw)
+            except (TypeError, ValueError):
+                return 0
+
+        data = sort_preserve_rank_tie_break_by(data, tie_key=_id_desc_tie)
         return format_timeline(data)
     except MastodonError as e:
         return _error(e)
@@ -852,9 +936,17 @@ async def mastodon_trending_links(
     limit: Annotated[int, Field(description="Max results")] = 10,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """Trending links shared on the instance."""
+    """Trending links shared on the instance.
+
+    DD-338 B.1.b: preserves server-returned trending rank; ties break on
+    ``url`` ascending for byte-deterministic ordering.
+    """
     try:
         data = await _get_client().trending_links(limit, instance)
+        data = sort_preserve_rank_tie_break_by(
+            data,
+            tie_key=lambda r: r.get("url", "") if isinstance(r, dict) else "",
+        )
         return format_trending_links(data)
     except MastodonError as e:
         return _error(e)
@@ -871,9 +963,14 @@ async def mastodon_bookmarks(
     max_id: Annotated[str | None, Field(description="Return bookmarks older than this ID (pagination)")] = None,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """List bookmarked statuses."""
+    """List bookmarked statuses.
+
+    DD-338 B.1.b: returns statuses sorted by id descending (newest-bookmarked
+    first); ordering is byte-deterministic across invocations.
+    """
     try:
         data = await _get_client().get_bookmarks(limit, max_id, instance)
+        data = sort_by_id_desc(data)
         return format_timeline(data)
     except MastodonError as e:
         return _error(e)
@@ -890,9 +987,14 @@ async def mastodon_favourites(
     max_id: Annotated[str | None, Field(description="Return favourites older than this ID (pagination)")] = None,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """List favourited statuses."""
+    """List favourited statuses.
+
+    DD-338 B.1.b: returns statuses sorted by id descending (newest-favourited
+    first); ordering is byte-deterministic across invocations.
+    """
     try:
         data = await _get_client().get_favourites(limit, max_id, instance)
+        data = sort_by_id_desc(data)
         return format_timeline(data)
     except MastodonError as e:
         return _error(e)
@@ -907,9 +1009,14 @@ async def mastodon_favourites(
 async def mastodon_lists(
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """List all lists."""
+    """List all lists.
+
+    DD-338 B.1.b: returns lists sorted by id ascending (creation order);
+    ordering is byte-deterministic across invocations.
+    """
     try:
         data = await _get_client().get_lists(instance)
+        data = sort_by_id_asc(data)
         return format_lists(data)
     except MastodonError as e:
         return _error(e)
@@ -926,9 +1033,14 @@ async def mastodon_list_accounts(
     limit: Annotated[int, Field(description="Max results")] = 40,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """Get accounts in a specific list."""
+    """Get accounts in a specific list.
+
+    DD-338 B.1.b: returns accounts sorted by id descending; ordering is
+    byte-deterministic across invocations.
+    """
     try:
         data = await _get_client().get_list_accounts(list_id, limit, instance)
+        data = sort_by_id_desc(data)
         return format_account_list(data)
     except MastodonError as e:
         return _error(e)
@@ -945,9 +1057,14 @@ async def mastodon_conversations(
     max_id: Annotated[str | None, Field(description="Return conversations older than this ID (pagination)")] = None,
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """List direct message conversations."""
+    """List direct message conversations.
+
+    DD-338 B.1.b: returns conversations sorted by id descending (newest-activity
+    first); ordering is byte-deterministic across invocations.
+    """
     try:
         data = await _get_client().get_conversations(limit, max_id, instance)
+        data = sort_by_id_desc(data)
         return format_conversations(data)
     except MastodonError as e:
         return _error(e)
@@ -962,9 +1079,16 @@ async def mastodon_conversations(
 async def mastodon_filters(
     instance: Annotated[str | None, Field(description="Target instance (omit for default)")] = None,
 ) -> str:
-    """List active content filters (v2 API with v1 fallback)."""
+    """List active content filters (v2 API with v1 fallback).
+
+    DD-338 B.1.b: returns filters sorted by id ascending (creation order);
+    ordering is byte-deterministic across invocations. The ``int(id)`` cast
+    handles both v2 (integer-shaped) and v1 (string-shaped) filter ids per
+    spec architect amendment OQ-2.
+    """
     try:
         data = await _get_client().get_filters(instance)
+        data = sort_by_id_asc(data)
         return format_filters(data)
     except MastodonError as e:
         return _error(e)
