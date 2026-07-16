@@ -97,3 +97,4 @@ conformance:
 # <state-root>/blade-config/mastodon-blade-mcp/config.yaml on approval.
 blade_domain_hint_patterns:
   patterns: []
+
